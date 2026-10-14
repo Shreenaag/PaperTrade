@@ -1,0 +1,238 @@
+// PaperTrade data model.
+// Conventions:
+//  - Money/prices: Decimal(20,4). Never JS floats. Single currency (INR) for the whole sim.
+//  - Quantities: whole shares (Int).
+//  - IDs: UUIDv7 (time-ordered, index friendly). Instruments are keyed by symbol so Kafka keys == FKs.
+//  - Postgres is the source of truth; Redis only caches; Kafka carries events.
+//  - Non-negative balance/quantity CHECK constraints live in the init migration SQL (Prisma cannot express them).
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------- Identity ----------
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  email       String   @unique // stored lower-cased
+  displayName String
+  avatarUrl   String?
+  role        Role     @default(USER)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  oauthAccounts OAuthAccount[]
+  account       Account?
+  orders        Order[]
+  trades        Trade[]
+  holdings      Holding[]
+  ledger        LedgerEntry[]
+
+  @@map("users")
+}
+
+// One row per linked OAuth identity (a user may link Google and GitHub).
+// Provider tokens are deliberately NOT stored: OAuth is used for identity only.
+// Sessions and OTP challenges live in Redis (see src/shared/redisKeys.ts).
+model OAuthAccount {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  userId            String   @db.Uuid
+  provider          String // "google" | "github"
+  providerAccountId String
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("oauth_accounts")
+}
+
+// ---------- Money ----------
+
+// Paper-cash wallet, 1:1 with user. available = cash - reservedCash.
+// reservedCash is held for open BUY orders so a user cannot overspend.
+model Account {
+  userId       String   @id @db.Uuid
+  cash         Decimal  @db.Decimal(20, 4)
+  reservedCash Decimal  @default(0) @db.Decimal(20, 4)
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("accounts")
+}
+
+enum LedgerEntryType {
+  INITIAL_GRANT
+  TRADE_BUY
+  TRADE_SELL
+  FEE
+  RESET
+}
+
+// Append-only audit trail of every cash movement. amount is signed (+credit / -debit).
+model LedgerEntry {
+  id           String          @id @default(uuid(7)) @db.Uuid
+  userId       String          @db.Uuid
+  type         LedgerEntryType
+  amount       Decimal         @db.Decimal(20, 4)
+  balanceAfter Decimal         @db.Decimal(20, 4)
+  tradeId      String?         @db.Uuid
+  createdAt    DateTime        @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trade Trade? @relation(fields: [tradeId], references: [id])
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([tradeId])
+  @@map("ledger_entries")
+}
+
+// ---------- Market ----------
+
+model Instrument {
+  symbol       String   @id @db.VarChar(16) // e.g. "RELIANCE"; also the Kafka message key
+  name         String
+  exchange     String   @default("NSE") @db.VarChar(8)
+  tickSize     Decimal  @default(0.05) @db.Decimal(10, 4)
+  lotSize      Int      @default(1)
+  initialPrice Decimal  @db.Decimal(20, 4) // starting point for the price simulator
+  volatility   Float    @default(0.25) // annualised sigma used by the price simulator
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  orders   Order[]
+  trades   Trade[]
+  holdings Holding[]
+
+  @@map("instruments")
+}
+
+// ---------- Trading ----------
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+}
+
+// PENDING: saved + published, not yet seen by the matching engine.
+// OPEN: resting LIMIT order. Terminal: FILLED, CANCELLED, REJECTED.
+enum OrderStatus {
+  PENDING
+  OPEN
+  PARTIALLY_FILLED
+  FILLED
+  CANCELLED
+  REJECTED
+}
+
+model Order {
+  id             String      @id @default(uuid(7)) @db.Uuid
+  userId         String      @db.Uuid
+  symbol         String      @db.VarChar(16)
+  clientOrderId  String?     @db.VarChar(64) // idempotency key from the client (double-click safe)
+  side           OrderSide
+  type           OrderType
+  quantity       Int
+  limitPrice     Decimal?    @db.Decimal(20, 4) // required when type = LIMIT
+  filledQuantity Int         @default(0)
+  avgFillPrice   Decimal?    @db.Decimal(20, 4)
+  status         OrderStatus @default(PENDING)
+  rejectReason   String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrument Instrument @relation(fields: [symbol], references: [symbol])
+  trades     Trade[]
+
+  @@unique([userId, clientOrderId])
+  @@index([userId, createdAt(sort: Desc)]) // order history
+  @@index([symbol, status]) // matching engine reloads open orders on restart
+  @@map("orders")
+}
+
+// One execution (fill) of an order. id is generated by the matching engine and carried in the
+// Kafka event, so settlement is idempotent: inserting the same trade twice fails on the PK.
+model Trade {
+  id         String    @id @db.Uuid
+  orderId    String    @db.Uuid
+  userId     String    @db.Uuid
+  symbol     String    @db.VarChar(16)
+  side       OrderSide
+  quantity   Int
+  price      Decimal   @db.Decimal(20, 4)
+  fee        Decimal   @default(0) @db.Decimal(20, 4)
+  executedAt DateTime
+
+  order      Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrument Instrument    @relation(fields: [symbol], references: [symbol])
+  ledger     LedgerEntry[]
+
+  @@index([userId, executedAt(sort: Desc)])
+  @@index([orderId])
+  @@map("trades")
+}
+
+// Current position per user per instrument. reservedQuantity is held for open SELL orders.
+model Holding {
+  userId           String   @db.Uuid
+  symbol           String   @db.VarChar(16)
+  quantity         Int
+  reservedQuantity Int      @default(0)
+  avgCost          Decimal  @db.Decimal(20, 4)
+  realizedPnl      Decimal  @default(0) @db.Decimal(20, 4)
+  updatedAt        DateTime @updatedAt
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrument Instrument @relation(fields: [symbol], references: [symbol])
+
+  @@id([userId, symbol])
+  @@index([symbol])
+  @@map("holdings")
+}
+
+// ---------- Event plumbing (Kafka reliability) ----------
+
+// Transactional outbox: write the event in the SAME DB transaction as the state change,
+// a relay publishes it to Kafka and sets publishedAt. No lost or phantom events.
+model OutboxEvent {
+  id          String    @id @db.Uuid // == event envelope id
+  topic       String
+  key         String
+  payload     Json
+  createdAt   DateTime  @default(now())
+  publishedAt DateTime?
+
+  @@index([publishedAt, createdAt])
+  @@map("outbox_events")
+}
+
+// Inbox / dedupe for consumers: Kafka is at-least-once, so each consumer records handled event ids.
+model ProcessedEvent {
+  consumer    String   @db.VarChar(64)
+  eventId     String   @db.Uuid
+  processedAt DateTime @default(now())
+
+  @@id([consumer, eventId])
+  @@map("processed_events")
+}

@@ -1,0 +1,89 @@
+name: papertrade
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-papertrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-papertrade}
+      POSTGRES_DB: ${POSTGRES_DB:-papertrade}
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    # AOF so sessions/prices survive a container restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Single-node KRaft broker (no ZooKeeper). Two listeners:
+  #   kafka:29092     -> other containers
+  #   localhost:9092  -> backend running on the host (npm run dev)
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ["9092:9092"]
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:29092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created by the backend (src/shared/events.ts) so partitions are explicit.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    # shortcut: no volume, so the event log resets on `docker compose down`; Postgres is the source of truth. Add a volume if you need replay across resets.
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Optional web UI for topics/messages: docker compose --profile tools up -d
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    profiles: [tools]
+    ports: ["8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: papertrade
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  # Containerised backend: docker compose --profile app up -d --build
+  backend:
+    build: ./backend
+    profiles: [app]
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-papertrade}:${POSTGRES_PASSWORD:-papertrade}@postgres:5432/${POSTGRES_DB:-papertrade}?schema=public
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:29092
+    ports: ["${PORT:-3000}:3000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
