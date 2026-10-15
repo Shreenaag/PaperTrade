@@ -3,11 +3,12 @@ import { createDb } from "./infra/db.js";
 import { createKafka, createProducer, ensureTopics } from "./infra/kafka.js";
 import { createRedis } from "./infra/redis.js";
 import { startFairValue } from "./modules/market/fairValue.js";
+import { startMatching } from "./modules/matching/matching.js";
 import { startRelay } from "./modules/orders/outbox.js";
 import { startSettlement } from "./modules/settlement/settlement.js";
 
 // The one background process (npm run worker): every non-HTTP job runs here, still talking over Kafka,
-// so there are only two processes to start (API + worker). Matching (P3b) and bots (P3c) plug in below.
+// so there are only two processes to start (API + worker). Bots (P3c) plug in below.
 const env = loadEnv();
 const db = createDb(env.DATABASE_URL);
 const redis = createRedis(env.REDIS_URL);
@@ -18,8 +19,13 @@ await Promise.all([db.$connect(), redis.connect()]);
 await ensureTopics(kafka);
 await producer.connect();
 
-const stops = [await startFairValue(db, redis), startRelay(db, producer), await startSettlement(kafka, db)];
-console.log("worker ready: fair-value, outbox relay, settlement");
+const stops = [
+  await startFairValue(db, redis),
+  startRelay(db, producer),
+  await startSettlement(kafka, db),
+  await startMatching(kafka, producer, db, redis),
+];
+console.log("worker ready: fair-value, outbox relay, settlement, matching");
 
 let closing = false;
 async function shutdown() {

@@ -48,6 +48,8 @@ export const Topics = {
         tradingDay,
       }),
       z.object({ kind: z.literal("CANCEL"), orderId: z.uuid(), userId: z.uuid(), symbol: z.string() }),
+      // Phase changes go through the log too, so replaying it rebuilds exactly the same book.
+      z.object({ kind: z.literal("CLOCK"), symbol: z.string(), tradingDay, phase: z.enum(MarketPhases) }),
     ]),
   },
   ordersUpdates: {
@@ -105,9 +107,10 @@ export interface EventEnvelope<T extends TopicKey = TopicKey> {
   payload: Payload<T>;
 }
 
-export function makeEvent<T extends TopicKey>(topic: T, payload: Payload<T>): EventEnvelope<T> {
+// Pass a stable id when the same event may be produced again (matching engine replay) so consumers dedupe it.
+export function makeEvent<T extends TopicKey>(topic: T, payload: Payload<T>, id: string = randomUUID()): EventEnvelope<T> {
   return {
-    id: randomUUID(),
+    id,
     topic: Topics[topic].name,
     occurredAt: new Date().toISOString(),
     payload: Topics[topic].payload.parse(payload) as Payload<T>,

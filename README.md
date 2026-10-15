@@ -16,7 +16,7 @@ npm install
 npm run db:migrate                 # apply migrations (+ generates the Prisma client)
 npm run db:seed                    # 10 NSE instruments
 npm run dev                        # http://localhost:3000/health/ready
-npm run worker                     # second terminal: fair value, outbox relay, settlement (all background jobs)
+npm run worker                     # second terminal: fair value, outbox relay, matching, settlement (all background jobs)
 npm test                           # unit + integration tests (auth tests skip if compose is down)
 ```
 
@@ -77,6 +77,11 @@ previous close and on the tick; MARKET fills at most 5% from the last price; ≤
 per order; per user 5 orders/s, 100/day, 20 open (bots exempt). Login is limited to 20/min per IP.
 Errors are `{ error: "CODE" }` (`INSUFFICIENT_CASH`, `PRICE_OUT_OF_BAND`, `RATE_LIMITED`, …).
 
+Matching (`src/modules/matching`): one in-memory book per symbol (`book.ts`, pure and unit-tested) fed by
+`orders.commands.v1`. Phase changes enter the same log as `CLOCK` commands, so on restart the engine replays
+today's commands and rebuilds identical books; fills/ends carry name-based ids, so re-sent events are deduped by
+settlement. Orders left open from an earlier day are expired on start.
+
 Storage stays small: Kafka topics keep 1 hour, published outbox rows are pruned after 1 hour, dedupe rows after 2.
 
 ## Architecture
@@ -89,7 +94,7 @@ Storage stays small: Kafka topics keep 1 hour, published outbox rows are pruned 
                    │                  │                      │
               Postgres            Redis                   Kafka
           (source of truth)   (sessions, OTP,     market.prices.v1   key=symbol
-                              profile cache,      orders.commands.v1 key=symbol  (PLACE, CANCEL)
+                              profile cache,      orders.commands.v1 key=symbol  (PLACE, CANCEL, CLOCK)
                               latest prices,      orders.updates.v1  key=userId
                               leaderboard)        orders.executions.v1 key=userId (FILL, END)
 ```
@@ -142,7 +147,7 @@ Schema changes go through `npm run db:migrate -- --name <change>`; never edit an
 - **P0 Foundation** ✅ infra, data model, skeleton, health checks
 - **P1 Auth** ✅ OAuth (Google/GitHub) → OTP → Redis session
 - **P2 Market data** ✅ hidden fair-value simulator (moves only in `OPEN`) that bots trade around
-- P3 Trading (P3a ✅ orders API, outbox relay, settlement · P3b matching engine · P3c bots): orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
+- P3 Trading (P3a ✅ orders API, outbox relay, settlement · P3b ✅ matching engine · P3c bots): orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
   traded price → `market.prices.v1` → Redis + `daily_bars`; dummy traders (`src/modules/bots`, `User.isBot`) place orders through the same path as players
 - P4 Portfolio & P&L
 - P5 UI, WebSockets, leaderboard

@@ -25,7 +25,11 @@ export function applyExecution(db: Db, event: EventEnvelope<"executions">): Prom
     if (count === 0) return false;
 
     const p = event.payload;
-    const order = await tx.order.findUniqueOrThrow({ where: { id: p.orderId } });
+    const order = await tx.order.findUnique({ where: { id: p.orderId } });
+    if (!order) {
+      console.warn(`settlement: order ${p.orderId} no longer exists (user deleted), skipping ${event.id}`);
+      return false; // the dedupe row still commits, so it is skipped once
+    }
     if (order.userId !== p.userId) throw new Error(`execution ${event.id}: order ${order.id} belongs to another user`);
     const after = p.kind === "FILL" ? await fill(tx, order, p) : await end(tx, order, p);
 

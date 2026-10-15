@@ -150,3 +150,8 @@ test("HTTP: orders need a verified session; bad bodies are rejected", { skip }, 
   assert.equal(list.json().orders.length, 1);
   await app.close();
 });
+
+test("execution for an order that no longer exists is skipped, not retried forever", { skip }, async () => {
+  const ev = makeEvent("executions", { kind: "END", orderId: randomUUID(), userId: randomUUID(), status: "EXPIRED", reason: "DAY_END" });
+  assert.equal(await applyExecution(db, ev), false);
+});
