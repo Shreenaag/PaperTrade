@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { makeEvent, parseEvent } from "./events.js";
 
-const tick = { symbol: "TCS", price: "3812.4500", ts: new Date().toISOString() };
+const tick = { symbol: "TCS", price: "3812.4500", tradingDay: 41_000, phase: "OPEN" as const, ts: new Date().toISOString() };
 
 test("event round-trips through JSON", () => {
   const ev = makeEvent("prices", tick);
@@ -17,4 +17,8 @@ test("money as a float is rejected", () => {
 test("event for the wrong topic is rejected", () => {
   const ev = makeEvent("prices", tick);
   assert.throws(() => parseEvent("tradesExecuted", JSON.stringify(ev)));
+});
+
+test("price tick outside the market calendar is rejected", () => {
+  assert.throws(() => makeEvent("prices", { ...tick, phase: "LUNCH" as "OPEN" }));
 });

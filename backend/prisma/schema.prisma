@@ -114,11 +114,29 @@ model Instrument {
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
 
-  orders   Order[]
-  trades   Trade[]
-  holdings Holding[]
+  orders    Order[]
+  trades    Trade[]
+  holdings  Holding[]
+  dailyBars DailyBar[]
 
   @@map("instruments")
+}
+
+// One row per instrument per trading day, written by the price simulator.
+// open = opening-auction price, close = POST_CLOSE price; the next day's PRE_OPEN starts from close.
+model DailyBar {
+  symbol     String   @db.VarChar(16)
+  tradingDay Int
+  open       Decimal  @db.Decimal(20, 4)
+  high       Decimal  @db.Decimal(20, 4)
+  low        Decimal  @db.Decimal(20, 4)
+  close      Decimal  @db.Decimal(20, 4)
+  updatedAt  DateTime @updatedAt
+
+  instrument Instrument @relation(fields: [symbol], references: [symbol])
+
+  @@id([symbol, tradingDay])
+  @@map("daily_bars")
 }
 
 // ---------- Trading ----------
@@ -134,7 +152,8 @@ enum OrderType {
 }
 
 // PENDING: saved + published, not yet seen by the matching engine.
-// OPEN: resting LIMIT order. Terminal: FILLED, CANCELLED, REJECTED.
+// OPEN: resting LIMIT order (or queued for the opening auction). Terminal: FILLED, CANCELLED, REJECTED,
+// EXPIRED (day order still unfilled when its trading day's POST_CLOSE ended).
 enum OrderStatus {
   PENDING
   OPEN
@@ -142,6 +161,7 @@ enum OrderStatus {
   FILLED
   CANCELLED
   REJECTED
+  EXPIRED
 }
 
 model Order {
@@ -157,6 +177,7 @@ model Order {
   avgFillPrice   Decimal?    @db.Decimal(20, 4)
   status         OrderStatus @default(PENDING)
   rejectReason   String?
+  tradingDay     Int // day order: valid until this day's POST_CLOSE ends (src/shared/marketClock.ts)
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -167,6 +188,7 @@ model Order {
   @@unique([userId, clientOrderId])
   @@index([userId, createdAt(sort: Desc)]) // order history
   @@index([symbol, status]) // matching engine reloads open orders on restart
+  @@index([tradingDay, status]) // end-of-day expiry
   @@map("orders")
 }
 
@@ -181,6 +203,7 @@ model Trade {
   quantity   Int
   price      Decimal   @db.Decimal(20, 4)
   fee        Decimal   @default(0) @db.Decimal(20, 4)
+  tradingDay Int
   executedAt DateTime
 
   order      Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
