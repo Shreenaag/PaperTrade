@@ -7,6 +7,7 @@ export const RedisKeys = {
   otpChallenge: (challengeId: string) => `otp:${challengeId}`, // hash {userId, codeHash, attempts}
   userProfile: (userId: string) => `user:profile:${userId}`, // JSON cache of users row
   prices: "market:prices", // hash symbol -> latest price JSON; one HGETALL = whole market
+  fairValue: "market:fairvalue", // hash symbol -> hidden fair value (decimal string); bots only, never exposed by the API
   portfolio: (userId: string) => `portfolio:${userId}`, // JSON snapshot
   leaderboard: "leaderboard:equity", // sorted set userId -> total equity
   rateLimit: (scope: string, id: string) => `rl:${scope}:${id}`,
