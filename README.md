@@ -16,7 +16,7 @@ npm install
 npm run db:migrate                 # apply migrations (+ generates the Prisma client)
 npm run db:seed                    # 10 NSE instruments
 npm run dev                        # http://localhost:3000/health/ready
-npm run worker:fair-value          # P2: hidden fair value per symbol -> Redis market:fairvalue (moves only in OPEN)
+npm run worker                     # second terminal: fair value, outbox relay, settlement (all background jobs)
 npm test                           # unit + integration tests (auth tests skip if compose is down)
 ```
 
@@ -64,25 +64,40 @@ then open `/me`.
 Protect any later route with `{ preHandler: requireAuth(redis) }` (`src/modules/auth/session.ts`); it sets `req.user`.
 The containerised backend runs with `NODE_ENV=production`, which requires `SMTP_URL`.
 
+## Orders (P3a)
+
+```
+POST   /orders      {symbol, side, type: MARKET|LIMIT, quantity, limitPrice?, clientOrderId?} -> 201 order (OPEN)
+GET    /orders?open=true                                                                  latest 50
+DELETE /orders/:id                                                                        202; the engine decides
+```
+Placing an order reserves cash (BUY: worst price × qty + 0.03% fee) or shares (SELL) in the same transaction
+that writes the order and its outbox command. Rules live in `src/shared/limits.ts`: LIMIT within ±10% of the
+previous close and on the tick; MARKET fills at most 5% from the last price; ≤ 10,000 shares and ≤ ₹10,00,000
+per order; per user 5 orders/s, 100/day, 20 open (bots exempt). Login is limited to 20/min per IP.
+Errors are `{ error: "CODE" }` (`INSUFFICIENT_CASH`, `PRICE_OUT_OF_BAND`, `RATE_LIMITED`, …).
+
+Storage stays small: Kafka topics keep 1 hour, published outbox rows are pruned after 1 hour, dedupe rows after 2.
+
 ## Architecture
 
 ```
             ┌───────────── backend (one codebase, modules) ─────────────┐
  browser ──►│ api (Fastify): auth · market · orders · portfolio · health│
-            │ workers (P2/P3): fair-value · bots · matching · settlement · relay│
+            │ worker (1 process): fair-value · relay · settlement · matching · bots│
             └──────┬──────────────────┬──────────────────────┬──────────┘
                    │                  │                      │
               Postgres            Redis                   Kafka
           (source of truth)   (sessions, OTP,     market.prices.v1   key=symbol
-                              profile cache,      orders.placed.v1   key=symbol
+                              profile cache,      orders.commands.v1 key=symbol  (PLACE, CANCEL)
                               latest prices,      orders.updates.v1  key=userId
-                              leaderboard)        trades.executed.v1 key=userId
+                              leaderboard)        orders.executions.v1 key=userId (FILL, END)
 ```
 
 Order flow (P3): API validates + reserves cash/shares and writes `Order` + `OutboxEvent` in one transaction →
-relay publishes `orders.placed` → matching engine crosses buyers and sellers in a per-symbol order book per the market phase
-(auction / continuous / closing price) → `trades.executed` →
-settlement writes `Trade`, updates `Account`/`Holding`/`LedgerEntry` (idempotent on trade id) → `orders.updates`.
+relay publishes `orders.commands` → matching engine crosses buyers and sellers in a per-symbol order book per the market phase
+(auction / continuous / closing price) → `orders.executions` (two FILLs per match, or END) →
+settlement writes `Trade`, updates `Account`/`Holding`/`LedgerEntry` (idempotent on event id) → `orders.updates`.
 
 ## Design decisions (locked in P0)
 
@@ -127,7 +142,7 @@ Schema changes go through `npm run db:migrate -- --name <change>`; never edit an
 - **P0 Foundation** ✅ infra, data model, skeleton, health checks
 - **P1 Auth** ✅ OAuth (Google/GitHub) → OTP → Redis session
 - **P2 Market data** ✅ hidden fair-value simulator (moves only in `OPEN`) that bots trade around
-- P3 Trading: orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
+- P3 Trading (P3a ✅ orders API, outbox relay, settlement · P3b matching engine · P3c bots): orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
   traded price → `market.prices.v1` → Redis + `daily_bars`; dummy traders (`src/modules/bots`, `User.isBot`) place orders through the same path as players
 - P4 Portfolio & P&L
 - P5 UI, WebSockets, leaderboard

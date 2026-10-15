@@ -16,7 +16,7 @@ test("money as a float is rejected", () => {
 
 test("event for the wrong topic is rejected", () => {
   const ev = makeEvent("prices", tick);
-  assert.throws(() => parseEvent("tradesExecuted", JSON.stringify(ev)));
+  assert.throws(() => parseEvent("executions", JSON.stringify(ev)));
 });
 
 test("price tick outside the market calendar is rejected", () => {

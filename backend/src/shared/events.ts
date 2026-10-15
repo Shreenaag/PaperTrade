@@ -5,9 +5,14 @@ import { MarketPhases } from "./marketClock.js";
 // Kafka contract for the whole system. Topic names carry a version suffix: a breaking payload
 // change means a new topic (".v2"), never an in-place edit.
 //
-// Partition key decides ordering: Kafka only guarantees order within a partition.
-//   market.prices / orders.placed -> key = symbol  (one instrument handled in order by one matcher)
-//   orders.updates / trades.executed -> key = userId (one user's balance updated serially)
+// Partition key decides ordering: Kafka only guarantees order within a partition of ONE topic.
+//   market.prices / orders.commands     -> key = symbol (one instrument handled in order by one matcher)
+//   orders.executions / orders.updates  -> key = userId (one user's balance updated serially)
+// Events that must stay in order share a topic: PLACE + CANCEL (a cancel never overtakes its order),
+// FILL + END (an order's reservation is released only after its last fill).
+//
+// Retention is short (space): the matcher only replays the current 10-minute trading day, and
+// Postgres (outbox) holds anything not yet published.
 //
 // Every event carries its tradingDay (src/shared/marketClock.ts). Price ticks also carry the phase:
 // the first OPEN tick of a day is the opening-auction price, POST_CLOSE ticks carry the closing price.
@@ -16,30 +21,39 @@ import { MarketPhases } from "./marketClock.js";
 const decimal = z.string().regex(/^-?\d+(\.\d+)?$/, "decimal string"); // money never travels as a float
 const side = z.enum(["BUY", "SELL"]);
 const tradingDay = z.number().int().nonnegative();
+const RETENTION_MS = 60 * 60 * 1000; // consumers dedupe for longer than this (ProcessedEvent pruning)
 
 export const Topics = {
   prices: {
     name: "market.prices.v1",
     partitions: 3,
+    retentionMs: RETENTION_MS,
     payload: z.object({ symbol: z.string(), price: decimal, tradingDay, phase: z.enum(MarketPhases), ts: z.iso.datetime() }),
   },
-  ordersPlaced: {
-    name: "orders.placed.v1",
+  orderCommands: {
+    name: "orders.commands.v1",
     partitions: 3,
-    payload: z.object({
-      orderId: z.uuid(),
-      userId: z.uuid(),
-      symbol: z.string(),
-      side,
-      type: z.enum(["MARKET", "LIMIT"]),
-      quantity: z.number().int().positive(),
-      limitPrice: decimal.nullable(),
-      tradingDay,
-    }),
+    retentionMs: RETENTION_MS,
+    payload: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("PLACE"),
+        orderId: z.uuid(),
+        userId: z.uuid(),
+        symbol: z.string(),
+        side,
+        type: z.enum(["MARKET", "LIMIT"]),
+        quantity: z.number().int().positive(),
+        limitPrice: decimal.nullable(), // LIMIT only
+        protectionPrice: decimal.nullable(), // MARKET only: worst price it may fill at
+        tradingDay,
+      }),
+      z.object({ kind: z.literal("CANCEL"), orderId: z.uuid(), userId: z.uuid(), symbol: z.string() }),
+    ]),
   },
   ordersUpdates: {
     name: "orders.updates.v1",
     partitions: 3,
+    retentionMs: RETENTION_MS,
     payload: z.object({
       orderId: z.uuid(),
       userId: z.uuid(),
@@ -49,21 +63,34 @@ export const Topics = {
       rejectReason: z.string().nullable(),
     }),
   },
-  tradesExecuted: {
-    name: "trades.executed.v1",
+  // Matching engine -> settlement. Settlement is the only writer of cash, holdings and order status.
+  executions: {
+    name: "orders.executions.v1",
     partitions: 3,
-    payload: z.object({
-      tradeId: z.uuid(),
-      orderId: z.uuid(),
-      userId: z.uuid(),
-      symbol: z.string(),
-      side,
-      quantity: z.number().int().positive(),
-      price: decimal,
-      fee: decimal,
-      tradingDay,
-      executedAt: z.iso.datetime(),
-    }),
+    retentionMs: RETENTION_MS,
+    payload: z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("FILL"),
+        tradeId: z.uuid(),
+        matchId: z.uuid(),
+        orderId: z.uuid(),
+        userId: z.uuid(),
+        symbol: z.string(),
+        side,
+        quantity: z.number().int().positive(),
+        price: decimal,
+        fee: decimal,
+        tradingDay,
+        executedAt: z.iso.datetime(),
+      }),
+      z.object({
+        kind: z.literal("END"), // no more fills: release what is still reserved
+        orderId: z.uuid(),
+        userId: z.uuid(),
+        status: z.enum(["CANCELLED", "EXPIRED", "REJECTED"]),
+        reason: z.string(), // e.g. USER, NO_LIQUIDITY, SELF_TRADE, DAY_END
+      }),
+    ]),
   },
 } as const;
 

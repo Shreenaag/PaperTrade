@@ -1,4 +1,7 @@
-import { PHASE_SECONDS } from "../../shared/marketClock.js";
+import type { Db } from "../../infra/db.js";
+import type { Redis } from "../../infra/redis.js";
+import { PHASE_SECONDS, sessionAt } from "../../shared/marketClock.js";
+import { RedisKeys } from "../../shared/redisKeys.js";
 
 // Hidden "true value" of each instrument. Players never see it; bots (P3) quote and trade around it,
 // and the traded price players see comes from the order book.
@@ -14,6 +17,31 @@ export function stepFairValue(price: number, sigma: number, dtSeconds: number, r
 
 export function toTickString(price: number, tickSize: number): string {
   return (Math.max(1, Math.round(price / tickSize)) * tickSize).toFixed(4);
+}
+
+// Moves each instrument's fair value once a second during OPEN (frozen in PRE_OPEN / POST_CLOSE) and keeps it
+// in Redis for the bots. Resumes from Redis; after a Redis wipe, from the last daily close, else the seeded price.
+export async function startFairValue(db: Db, redis: Redis, tickSeconds = 1): Promise<() => void> {
+  const saved = await redis.hgetall(RedisKeys.fairValue);
+  const instruments = await db.instrument.findMany({
+    where: { isActive: true },
+    include: { dailyBars: { orderBy: { tradingDay: "desc" }, take: 1 } },
+  });
+  const state = instruments.map((i) => ({
+    symbol: i.symbol,
+    sigma: i.volatility,
+    tick: Number(i.tickSize),
+    price: Number(saved[i.symbol] ?? i.dailyBars[0]?.close ?? i.initialPrice),
+  }));
+  const save = () => redis.hset(RedisKeys.fairValue, Object.fromEntries(state.map((s) => [s.symbol, toTickString(s.price, s.tick)])));
+  await save();
+
+  const timer = setInterval(() => {
+    if (sessionAt().phase !== "OPEN") return;
+    for (const s of state) s.price = stepFairValue(s.price, s.sigma, tickSeconds);
+    save().catch((err) => console.error("fair-value save failed", err));
+  }, tickSeconds * 1000);
+  return () => clearInterval(timer);
 }
 
 // Box-Muller; 1 - rand() keeps log() away from 0.

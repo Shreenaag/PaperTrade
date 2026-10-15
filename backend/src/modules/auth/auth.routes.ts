@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
 import type { FastifyBaseLogger, FastifyPluginAsync } from "fastify";
 import type { Db } from "../../infra/db.js";
-import type { Redis } from "../../infra/redis.js";
+import { countHit, type Redis } from "../../infra/redis.js";
+import { LOGIN_PER_MINUTE_PER_IP } from "../../shared/limits.js";
 import { RedisKeys, RedisTtlSeconds } from "../../shared/redisKeys.js";
 import type { SendOtp } from "./mailer.js";
 import { pkcePair, type OAuthProviders, type ProviderName } from "./oauth.js";
@@ -68,6 +69,9 @@ export const authRoutes =
       async (req, reply) => {
         const provider = providers[req.params.provider];
         if (!provider) return reply.code(404).send({ error: "PROVIDER_DISABLED" });
+        if ((await countHit(redis, RedisKeys.rateLimit("login", req.ip), 60)) > LOGIN_PER_MINUTE_PER_IP) {
+          return reply.code(429).send({ error: "RATE_LIMITED" });
+        }
 
         const state = randomBytes(16).toString("base64url");
         const { codeVerifier, codeChallenge } = pkcePair();
