@@ -1,15 +1,20 @@
+import cookie from "@fastify/cookie";
 import Fastify, { type FastifyInstance } from "fastify";
+import { authRoutes, type AuthDeps } from "./modules/auth/auth.routes.js";
 import { healthRoutes, type HealthChecks } from "./modules/health/health.routes.js";
+import { marketRoutes } from "./modules/market/market.routes.js";
 
 export interface AppOptions {
   logLevel?: string;
   prettyLogs?: boolean;
   checks: HealthChecks;
+  auth?: AuthDeps; // omitted in tests that don't need auth
 }
 
 // Pure factory: no connections opened here, so tests can build the app with fake checks.
 // Each feature module (auth, market, orders, portfolio) registers its routes below.
-export function buildApp({ logLevel = "info", prettyLogs = false, checks }: AppOptions): FastifyInstance {
+// Protected routes use `preHandler: requireAuth(redis)` from modules/auth/session.ts.
+export function buildApp({ logLevel = "info", prettyLogs = false, checks, auth }: AppOptions): FastifyInstance {
   const app = Fastify({
     logger: {
       level: logLevel,
@@ -17,7 +22,12 @@ export function buildApp({ logLevel = "info", prettyLogs = false, checks }: AppO
     },
   });
 
+  app.register(cookie);
+  app.decorateRequest("user", null);
+
   app.register(healthRoutes(checks));
+  app.register(marketRoutes());
+  if (auth) app.register(authRoutes(auth));
 
   return app;
 }
