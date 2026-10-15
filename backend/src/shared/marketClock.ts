@@ -16,7 +16,7 @@ export const PHASE_SECONDS: Record<MarketPhase, number> = { PRE_OPEN: 150, OPEN:
 // How the matching engine fills orders in each phase.
 export const FILL_MODE = {
   PRE_OPEN: "queue", // collect for the opening auction
-  OPEN: "continuous", // against the latest simulated price
+  OPEN: "continuous", // in the order book, price-time priority
   POST_CLOSE: "closing-price", // only at the day's close
 } as const satisfies Record<MarketPhase, string>;
 

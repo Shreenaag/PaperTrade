@@ -109,8 +109,8 @@ model Instrument {
   exchange     String   @default("NSE") @db.VarChar(8)
   tickSize     Decimal  @default(0.05) @db.Decimal(10, 4)
   lotSize      Int      @default(1)
-  initialPrice Decimal  @db.Decimal(20, 4) // starting point for the price simulator
-  volatility   Float    @default(0.25) // annualised sigma used by the price simulator
+  initialPrice Decimal  @db.Decimal(20, 4) // starting point for the fair-value simulator
+  volatility   Float    @default(0.25) // annualised sigma used by the fair-value simulator
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
 
@@ -122,7 +122,7 @@ model Instrument {
   @@map("instruments")
 }
 
-// One row per instrument per trading day, written by the price simulator.
+// One row per instrument per trading day, written from traded prices by the matching engine.
 // open = opening-auction price, close = POST_CLOSE price; the next day's PRE_OPEN starts from close.
 model DailyBar {
   symbol     String   @db.VarChar(16)
