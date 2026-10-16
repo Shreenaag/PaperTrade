@@ -11,6 +11,7 @@ export const RedisKeys = {
   portfolio: (userId: string) => `portfolio:${userId}`, // JSON snapshot
   leaderboard: "leaderboard:equity", // sorted set userId -> total equity
   rateLimit: (scope: string, id: string) => `rl:${scope}:${id}`,
+  workerLock: "lock:worker", // only one `npm run worker` at a time (src/worker.ts)
 } as const;
 
 export const RedisTtlSeconds = {
@@ -21,4 +22,5 @@ export const RedisTtlSeconds = {
   otpResendCooldown: 60,
   userProfile: 10 * 60,
   portfolio: 30,
+  workerLock: 15, // a crashed worker frees the lock this long after its last renewal
 } as const;

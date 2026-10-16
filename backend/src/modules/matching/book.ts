@@ -12,6 +12,7 @@ import { MarketPhases, type MarketPhase } from "../../shared/marketClock.js";
 //   -> next day unfilled orders EXPIRE, the day's bar is emitted
 // MARKET orders never rest after the auction: they fill up to their protection price, the rest is cancelled.
 // Self-trade: the newer of the two orders is cancelled.
+// Kafka is at-least-once, so a PLACE can arrive twice: the book ignores an order id it has already seen today.
 
 type Command = Payload<"orderCommands">;
 type Place = Extract<Command, { kind: "PLACE" }>;
@@ -60,6 +61,7 @@ export class Book {
   private bids: BookOrder[] = []; // best first: price desc, then seq asc
   private asks: BookOrder[] = []; // best first: price asc, then seq asc
   private seq = 0;
+  private seen = new Set<string>(); // order ids placed today
   private prevClose: number;
   private last: number | null = null;
   private bar: { open: number; high: number; low: number } | null = null;
@@ -109,6 +111,8 @@ export class Book {
   }
 
   private place(cmd: Place) {
+    if (this.seen.has(cmd.orderId)) return;
+    this.seen.add(cmd.orderId);
     const o: BookOrder = {
       orderId: cmd.orderId,
       userId: cmd.userId,
@@ -235,6 +239,7 @@ export class Book {
     for (const o of [...this.bids, ...this.asks]) this.end(o, "EXPIRED", "DAY_END");
     this.bids = [];
     this.asks = [];
+    this.seen.clear(); // a late copy of an earlier day's order is expired again on arrival, same END id
     if (this.bar) {
       const { open, high, low } = this.bar;
       this.out.push({ kind: "BAR", tradingDay: this.day, open: fromUnits(open), high: fromUnits(high), low: fromUnits(low), close: fromUnits(this.closePrice) });

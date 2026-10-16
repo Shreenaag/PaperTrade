@@ -117,6 +117,19 @@ test("cancel removes a resting order; an order from a finished day is expired on
   assert.deepEqual(ends(book.handle(limit(A, "BUY", 1, "99", DAY - 1), AT)), [["EXPIRED", "DAY_END"]]);
 });
 
+test("a re-delivered PLACE is ignored: resting, filled or ended orders are never added twice", () => {
+  const book = openBook();
+  const resting = limit(A, "BUY", 5, "99");
+  const ended = limit(A, "SELL", 5, "98"); // crosses A's own bid: self-trade
+  const filled = limit(B, "SELL", 2, "99");
+  for (const c of [resting, ended, filled]) book.handle(c, AT);
+  assert.equal(book.openOrders, 1); // the rest of A's bid
+
+  for (const c of [resting, ended, filled]) assert.deepEqual(book.handle(c, AT), []);
+  assert.equal(book.openOrders, 1);
+  assert.deepEqual(fills(book.handle(limit(C, "SELL", 5, "99"), AT)), [["BUY", 3, "99.0000"], ["SELL", 3, "99.0000"]]);
+});
+
 test("replay is deterministic: same commands -> identical events and ids", () => {
   const commands = [limit(A, "BUY", 10, "103"), limit(B, "SELL", 4, "100"), clock("OPEN"), limit(C, "SELL", 10, "102"), market(B, "BUY", 3, "105")];
   const run = () => {
