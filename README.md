@@ -16,9 +16,11 @@ npm install
 npm run db:migrate                 # apply migrations (+ generates the Prisma client)
 npm run db:seed                    # 10 NSE instruments
 npm run dev                        # http://localhost:3000/health/ready
-npm run worker:fair-value          # P2: hidden fair value per symbol -> Redis market:fairvalue (moves only in OPEN)
+npm run worker                     # second terminal: fair value, outbox relay, matching, settlement, bots (all background jobs)
 npm test                           # unit + integration tests (auth tests skip if compose is down)
 ```
+
+Run **one** worker. A second one waits 15 s for the Redis lock `lock:worker`, then exits: two would publish every command twice and run two sets of bots.
 
 Optional:
 - Kafka UI: `docker compose --profile tools up -d` → http://localhost:8080
@@ -64,25 +66,61 @@ then open `/me`.
 Protect any later route with `{ preHandler: requireAuth(redis) }` (`src/modules/auth/session.ts`); it sets `req.user`.
 The containerised backend runs with `NODE_ENV=production`, which requires `SMTP_URL`.
 
+## Orders (P3a)
+
+```
+POST   /orders      {symbol, side, type: MARKET|LIMIT, quantity, limitPrice?, clientOrderId?} -> 201 order (OPEN)
+GET    /orders?open=true                                                                  latest 50
+DELETE /orders/:id                                                                        202; the engine decides
+```
+Placing an order reserves cash (BUY: worst price × qty + 0.03% fee) or shares (SELL) in the same transaction
+that writes the order and its outbox command. Rules live in `src/shared/limits.ts`: LIMIT within ±10% of the
+previous close and on the tick; MARKET fills at most 5% from the last price; ≤ 10,000 shares and ≤ ₹10,00,000
+per order; per user 5 orders/s, 100/day, 20 open (bots exempt). Login is limited to 20/min per IP.
+Errors are `{ error: "CODE" }` (`INSUFFICIENT_CASH`, `PRICE_OUT_OF_BAND`, `RATE_LIMITED`, …).
+
+Matching (`src/modules/matching`): one in-memory book per symbol (`book.ts`, pure and unit-tested) fed by
+`orders.commands.v1`. Phase changes enter the same log as `CLOCK` commands, so on restart the engine replays
+today's commands and rebuilds identical books; fills/ends carry name-based ids, so re-sent events are deduped by
+settlement. Orders left open from an earlier day are expired on start.
+
+## Bots (P3c)
+
+Dummy traders compete with players in the same order books (`src/modules/bots`, started by `npm run worker`).
+On start the worker creates three bot users per instrument (`isBot`, `bot.<kind>.<symbol>@bots.papertrade.local`),
+each with ₹20,00,000 cash and ₹10,00,000 of its stock. They call `placeOrder`/`cancelOrder` directly, so they hit the
+same checks, reservations, outbox, matching and settlement as players; only the per-user rate limits are skipped.
+
+| Bot | When | Does |
+|---|---|---|
+| market maker | `PRE_OPEN`, `OPEN` | one bid and one ask at the hidden fair value ±0.1%, requoted when fair value moves off them |
+| noise | `OPEN` | random small MARKET or LIMIT (±0.5% of fair value) orders; at most 3 resting |
+| momentum | `OPEN` | MARKET order in the direction of a ≥0.2% move in the traded price since its last look |
+
+Each bot acts about every 5 s (≈6 orders/s in total). Every `PRE_OPEN`, once yesterday's orders are settled, bots
+are topped back up to their starting cash (`RESET` ledger entry) and shares. Rules live in `strategies.ts` (pure, unit-tested).
+
+Storage stays small: Kafka topics keep 1 hour, published outbox rows are pruned after 1 hour, dedupe rows after 2.
+
 ## Architecture
 
 ```
             ┌───────────── backend (one codebase, modules) ─────────────┐
  browser ──►│ api (Fastify): auth · market · orders · portfolio · health│
-            │ workers (P2/P3): fair-value · bots · matching · settlement · relay│
+            │ worker (1 process): fair-value · relay · settlement · matching · bots│
             └──────┬──────────────────┬──────────────────────┬──────────┘
                    │                  │                      │
               Postgres            Redis                   Kafka
           (source of truth)   (sessions, OTP,     market.prices.v1   key=symbol
-                              profile cache,      orders.placed.v1   key=symbol
+                              profile cache,      orders.commands.v1 key=symbol  (PLACE, CANCEL, CLOCK)
                               latest prices,      orders.updates.v1  key=userId
-                              leaderboard)        trades.executed.v1 key=userId
+                              leaderboard)        orders.executions.v1 key=userId (FILL, END)
 ```
 
 Order flow (P3): API validates + reserves cash/shares and writes `Order` + `OutboxEvent` in one transaction →
-relay publishes `orders.placed` → matching engine crosses buyers and sellers in a per-symbol order book per the market phase
-(auction / continuous / closing price) → `trades.executed` →
-settlement writes `Trade`, updates `Account`/`Holding`/`LedgerEntry` (idempotent on trade id) → `orders.updates`.
+relay publishes `orders.commands` → matching engine crosses buyers and sellers in a per-symbol order book per the market phase
+(auction / continuous / closing price) → `orders.executions` (two FILLs per match, or END) →
+settlement writes `Trade`, updates `Account`/`Holding`/`LedgerEntry` (idempotent on event id) → `orders.updates`.
 
 ## Design decisions (locked in P0)
 
@@ -116,7 +154,7 @@ backend/
   src/shared/events.ts      Kafka topics + event contracts
   src/shared/redisKeys.ts   Redis key names + TTLs
   src/shared/marketClock.ts 10-minute trading day: phases + fill mode per phase
-  src/modules/<feature>/    one folder per feature: health, auth, market (orders, portfolio next)
+  src/modules/<feature>/    one folder per feature: health, auth, market, orders, matching, settlement, bots (portfolio next)
 ```
 
 Adding a later phase = new folder in `src/modules/`, new env vars in `env.ts`, and (if needed) an additive migration.
@@ -127,7 +165,7 @@ Schema changes go through `npm run db:migrate -- --name <change>`; never edit an
 - **P0 Foundation** ✅ infra, data model, skeleton, health checks
 - **P1 Auth** ✅ OAuth (Google/GitHub) → OTP → Redis session
 - **P2 Market data** ✅ hidden fair-value simulator (moves only in `OPEN`) that bots trade around
-- P3 Trading: orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
+- **P3 Trading** ✅ (P3a ✅ orders API, outbox relay, settlement · P3b ✅ matching engine · P3c ✅ bots): orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
   traded price → `market.prices.v1` → Redis + `daily_bars`; dummy traders (`src/modules/bots`, `User.isBot`) place orders through the same path as players
 - P4 Portfolio & P&L
 - P5 UI, WebSockets, leaderboard

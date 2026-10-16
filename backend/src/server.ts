@@ -41,6 +41,7 @@ const app = buildApp({
       secureCookies: env.APP_BASE_URL.startsWith("https://"),
     },
   },
+  orders: { db, redis },
 });
 
 // Fail fast: refuse to serve traffic until every dependency is reachable.

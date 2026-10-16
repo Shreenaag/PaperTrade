@@ -26,7 +26,16 @@ export async function ensureTopics(kafka: Kafka, replicationFactor = 1): Promise
     if (missing.length) {
       await admin.createTopics({
         waitForLeaders: true,
-        topics: missing.map((t) => ({ topic: t.name, numPartitions: t.partitions, replicationFactor })),
+        topics: missing.map((t) => ({
+          topic: t.name,
+          numPartitions: t.partitions,
+          replicationFactor,
+          // small segments so old data is actually deleted soon after retention (default segment is 1 GB)
+          configEntries: [
+            { name: "retention.ms", value: String(t.retentionMs) },
+            { name: "segment.ms", value: String(Math.min(t.retentionMs, 10 * 60 * 1000)) },
+          ],
+        })),
       });
     }
   } finally {

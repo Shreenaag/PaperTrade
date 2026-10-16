@@ -30,6 +30,10 @@ export interface MarketSession {
   phaseEndsAt: Date;
 }
 
+export function dayStartsAt(tradingDay: number): Date {
+  return new Date(EPOCH_MS + tradingDay * DAY_SECONDS * 1000);
+}
+
 export function sessionAt(now: Date = new Date()): MarketSession {
   const elapsedMs = now.getTime() - EPOCH_MS;
   const tradingDay = Math.floor(elapsedMs / (DAY_SECONDS * 1000));

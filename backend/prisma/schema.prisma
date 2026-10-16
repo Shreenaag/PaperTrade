@@ -30,6 +30,7 @@ model User {
   displayName String
   avatarUrl   String?
   role        Role     @default(USER)
+  isBot       Boolean  @default(false) // dummy trader (P3c): never logs in, skips per-user rate limits
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -151,8 +152,8 @@ enum OrderType {
   LIMIT
 }
 
-// PENDING: saved + published, not yet seen by the matching engine.
-// OPEN: resting LIMIT order (or queued for the opening auction). Terminal: FILLED, CANCELLED, REJECTED,
+// OPEN: accepted (saved + queued for the matching engine via the outbox), nothing filled yet.
+// PENDING is unused: once the order and its outbox row commit, it is guaranteed to reach the engine. Terminal: FILLED, CANCELLED, REJECTED,
 // EXPIRED (day order still unfilled when its trading day's POST_CLOSE ended).
 enum OrderStatus {
   PENDING
@@ -175,6 +176,7 @@ model Order {
   limitPrice     Decimal?    @db.Decimal(20, 4) // required when type = LIMIT
   filledQuantity Int         @default(0)
   avgFillPrice   Decimal?    @db.Decimal(20, 4)
+  reservedCash   Decimal     @default(0) @db.Decimal(20, 4) // BUY: part of accounts.reservedCash still held for this order
   status         OrderStatus @default(PENDING)
   rejectReason   String?
   tradingDay     Int // day order: valid until this day's POST_CLOSE ends (src/shared/marketClock.ts)
@@ -196,6 +198,7 @@ model Order {
 // Kafka event, so settlement is idempotent: inserting the same trade twice fails on the PK.
 model Trade {
   id         String    @id @db.Uuid
+  matchId    String    @db.Uuid // one match = two trades (buyer's and seller's) with the same matchId
   orderId    String    @db.Uuid
   userId     String    @db.Uuid
   symbol     String    @db.VarChar(16)
@@ -213,6 +216,7 @@ model Trade {
 
   @@index([userId, executedAt(sort: Desc)])
   @@index([orderId])
+  @@index([matchId])
   @@map("trades")
 }
 
