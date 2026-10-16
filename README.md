@@ -167,5 +167,6 @@ Schema changes go through `npm run db:migrate -- --name <change>`; never edit an
 - **P2 Market data** ✅ hidden fair-value simulator (moves only in `OPEN`) that bots trade around
 - **P3 Trading** ✅ (P3a ✅ orders API, outbox relay, settlement · P3b ✅ matching engine · P3c ✅ bots): orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
   traded price → `market.prices.v1` → Redis + `daily_bars`; dummy traders (`src/modules/bots`, `User.isBot`) place orders through the same path as players
-- P4 Portfolio & P&L
+- **P4 Portfolio & P&L** ✅ `GET /portfolio` (cash, positions at last price, realized/unrealized P&L, return %),
+  `GET /trades` and `GET /orders` with `?before=<id>&limit=` keyset paging
 - P5 UI, WebSockets, leaderboard

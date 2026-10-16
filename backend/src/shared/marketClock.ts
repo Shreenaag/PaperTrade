@@ -13,13 +13,6 @@ export type MarketPhase = (typeof MarketPhases)[number];
 
 export const PHASE_SECONDS: Record<MarketPhase, number> = { PRE_OPEN: 150, OPEN: 300, POST_CLOSE: 150 };
 
-// How the matching engine fills orders in each phase.
-export const FILL_MODE = {
-  PRE_OPEN: "queue", // collect for the opening auction
-  OPEN: "continuous", // in the order book, price-time priority
-  POST_CLOSE: "closing-price", // only at the day's close
-} as const satisfies Record<MarketPhase, string>;
-
 export const DAY_SECONDS = MarketPhases.reduce((s, p) => s + PHASE_SECONDS[p], 0); // 600
 const EPOCH_MS = Date.UTC(2026, 0, 1); // trading day 0; days start on :00/:10/:20... boundaries
 

@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type { Db } from "../../infra/db.js";
 import type { Kafka, Producer } from "../../infra/kafka.js";
 import type { Redis } from "../../infra/redis.js";
@@ -69,16 +70,26 @@ export async function startMatching(kafka: Kafka, producer: Producer, db: Db, re
       }
       const book = books.get(event.payload.symbol);
       if (!book) return; // API only accepts active instruments
-      await emit(book, book.handle(event.payload, new Date(Number(message.timestamp)).toISOString()));
+      // Handle once, then retry only the sending: a redelivered command is ignored by the book (seen ids),
+      // so letting Kafka redeliver after a failed send would lose these events.
+      const events = book.handle(event.payload, new Date(Number(message.timestamp)).toISOString());
+      await untilSent(() => emit(book, events));
     },
   });
 
   // Phase changes enter the log as CLOCK commands (one per symbol). Duplicates are harmless: a book ignores
   // a phase it has already reached.
   let lastClock = "";
+  let lastDay = today;
   const tick = async () => {
     const { tradingDay, phase } = sessionAt();
     if (`${tradingDay}:${phase}` === lastClock) return;
+    if (tradingDay !== lastDay) {
+      // Orders the book never saw (Kafka log wiped mid-day) would otherwise stay open forever. Two days back,
+      // so a late fill from yesterday's close always reaches settlement before its order's END.
+      await expireStaleOrders(db, producer, tradingDay - 1);
+      lastDay = tradingDay;
+    }
     await producer.send({
       topic: Topics.orderCommands.name,
       messages: [...books.keys()].map((symbol) => ({
@@ -97,11 +108,22 @@ export async function startMatching(kafka: Kafka, producer: Producer, db: Db, re
   };
 }
 
-// Orders from earlier days still open in the DB (the worker was down at day end, or Kafka was reset):
+export async function untilSent(send: () => Promise<void>, waitMs = 1000): Promise<void> {
+  for (;;) {
+    try {
+      return await send();
+    } catch (err) {
+      console.error("matching: sending results failed, retrying", err); // events have stable ids: resending is safe
+      await sleep(waitMs);
+    }
+  }
+}
+
+// Orders from before `beforeDay` still open in the DB (the worker was down at day end, or Kafka was reset):
 // expire them so their reservations come back. Same END id as the book would use, so never applied twice.
-async function expireStaleOrders(db: Db, producer: Producer, today: number) {
+export async function expireStaleOrders(db: Db, producer: Producer, beforeDay: number) {
   const stale = await db.order.findMany({
-    where: { tradingDay: { lt: today }, status: { in: ["OPEN", "PARTIALLY_FILLED"] } },
+    where: { tradingDay: { lt: beforeDay }, status: { in: ["OPEN", "PARTIALLY_FILLED"] } },
     select: { id: true, userId: true },
   });
   if (!stale.length) return;

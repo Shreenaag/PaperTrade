@@ -1,5 +1,5 @@
 import { Kafka, logLevel, Partitioners, type Producer } from "kafkajs";
-import { Topics, type EventEnvelope, type TopicKey } from "../shared/events.js";
+import { Topics } from "../shared/events.js";
 
 export function createKafka(brokers: string[], clientId: string): Kafka {
   return new Kafka({ clientId, brokers, logLevel: logLevel.WARN });
@@ -41,13 +41,6 @@ export async function ensureTopics(kafka: Kafka, replicationFactor = 1): Promise
   } finally {
     await admin.disconnect();
   }
-}
-
-export async function publish<T extends TopicKey>(producer: Producer, key: string, event: EventEnvelope<T>): Promise<void> {
-  await producer.send({
-    topic: event.topic,
-    messages: [{ key, value: JSON.stringify(event), headers: { "event-id": event.id } }],
-  });
 }
 
 export type { Kafka, Producer };
