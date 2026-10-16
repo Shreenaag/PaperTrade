@@ -1,4 +1,4 @@
-import { Prisma, type Order, type OrderSide, type OrderType } from "../../generated/prisma/client.js";
+import { Prisma, type Order, type OrderSide, type OrderType, type Trade } from "../../generated/prisma/client.js";
 import type { Db } from "../../infra/db.js";
 import { countHit, type Redis } from "../../infra/redis.js";
 import { makeEvent, type Payload } from "../../shared/events.js";
@@ -120,12 +120,62 @@ export async function cancelOrder(db: Db, userId: string, orderId: string): Prom
   await enqueueCommand(db, order.symbol, { kind: "CANCEL", orderId, userId, symbol: order.symbol });
 }
 
-export function listOrders(db: Db, userId: string, openOnly: boolean): Promise<Order[]> {
+export interface Page {
+  before?: string; // id of the last row of the previous page
+  limit?: number;
+}
+const pageSize = (limit = 50) => Math.min(limit, 100);
+
+// Keyset paging, newest first. The cursor row is looked up within the user's own rows,
+// so a foreign or unknown id gives an empty page instead of leaking another user's neighbours.
+export async function listOrders(db: Db, userId: string, openOnly: boolean, { before, limit }: Page = {}): Promise<Order[]> {
+  const cursor = before ? await db.order.findFirst({ where: { id: before, userId } }) : null;
+  if (before && !cursor) return [];
   return db.order.findMany({
-    where: { userId, ...(openOnly && { status: { in: [...OPEN_STATUSES] } }) },
-    orderBy: { createdAt: "desc" },
-    take: 50,
+    where: {
+      userId,
+      ...(openOnly && { status: { in: [...OPEN_STATUSES] } }),
+      ...(cursor && { OR: [{ createdAt: { lt: cursor.createdAt } }, { createdAt: cursor.createdAt, id: { lt: cursor.id } }] }),
+    },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: pageSize(limit),
   });
+}
+
+export async function listTrades(db: Db, userId: string, { before, limit, symbol }: Page & { symbol?: string } = {}): Promise<Trade[]> {
+  const cursor = before ? await db.trade.findFirst({ where: { id: before, userId } }) : null;
+  if (before && !cursor) return [];
+  return db.trade.findMany({
+    where: {
+      userId,
+      ...(symbol && { symbol }),
+      ...(cursor && { OR: [{ executedAt: { lt: cursor.executedAt } }, { executedAt: cursor.executedAt, id: { lt: cursor.id } }] }),
+    },
+    orderBy: [{ executedAt: "desc" }, { id: "desc" }],
+    take: pageSize(limit),
+  });
+}
+
+// Price to value a position at: last traded price (Redis, written by the matcher), else the latest daily close,
+// else the instrument's initial price. One HGETALL plus at most one query for the symbols with no tick.
+export async function lastPrices(db: Db, redis: Redis, instruments: { symbol: string; initialPrice: Decimal }[]): Promise<Map<string, Decimal>> {
+  const ticks = await redis.hgetall(RedisKeys.prices);
+  const prices = new Map<string, Decimal>();
+  for (const { symbol } of instruments) {
+    const tick = ticks[symbol];
+    if (tick) prices.set(symbol, new Decimal((JSON.parse(tick) as Payload<"prices">).price));
+  }
+  const misses = instruments.filter((i) => !prices.has(i.symbol));
+  if (misses.length) {
+    const bars = await db.dailyBar.findMany({
+      where: { symbol: { in: misses.map((i) => i.symbol) } },
+      orderBy: [{ symbol: "asc" }, { tradingDay: "desc" }],
+      distinct: ["symbol"],
+    });
+    const closes = new Map(bars.map((b) => [b.symbol, b.close]));
+    for (const i of misses) prices.set(i.symbol, closes.get(i.symbol) ?? i.initialPrice);
+  }
+  return prices;
 }
 
 // Previous close anchors the LIMIT band; last traded price (Redis, written by the matcher) anchors MARKET orders.

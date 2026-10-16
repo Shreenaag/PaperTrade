@@ -4,6 +4,7 @@ import { authRoutes, type AuthDeps } from "./modules/auth/auth.routes.js";
 import { healthRoutes, type HealthChecks } from "./modules/health/health.routes.js";
 import { marketRoutes } from "./modules/market/market.routes.js";
 import { ordersRoutes, type OrdersDeps } from "./modules/orders/orders.routes.js";
+import { portfolioRoutes } from "./modules/portfolio/portfolio.routes.js";
 
 export interface AppOptions {
   logLevel?: string;
@@ -30,7 +31,10 @@ export function buildApp({ logLevel = "info", prettyLogs = false, checks, auth, 
   app.register(healthRoutes(checks));
   app.register(marketRoutes());
   if (auth) app.register(authRoutes(auth));
-  if (orders) app.register(ordersRoutes(orders));
+  if (orders) {
+    app.register(ordersRoutes(orders));
+    app.register(portfolioRoutes(orders)); // same {db, redis} deps
+  }
 
   return app;
 }

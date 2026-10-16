@@ -2,7 +2,12 @@ import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import type { Db } from "../../infra/db.js";
 import type { Redis } from "../../infra/redis.js";
 import { requireAuth } from "../auth/session.js";
-import { cancelOrder, listOrders, OrderError, placeOrder, type PlaceOrderInput } from "./orders.service.js";
+import { cancelOrder, listOrders, listTrades, OrderError, placeOrder, type Page, type PlaceOrderInput } from "./orders.service.js";
+
+const pageQuery = {
+  before: { type: "string", format: "uuid" },
+  limit: { type: "integer", minimum: 1, maximum: 100 },
+} as const;
 
 export interface OrdersDeps {
   db: Db;
@@ -10,7 +15,8 @@ export interface OrdersDeps {
 }
 
 //   POST   /orders      {symbol, side, type, quantity, limitPrice?, clientOrderId?} -> 201 order (OPEN, funds reserved)
-//   GET    /orders?open=true                                                      -> latest 50
+//   GET    /orders?open=true&before=<orderId>&limit=50                            -> newest first, limit ≤ 100
+//   GET    /trades?symbol=&before=<tradeId>&limit=50                              -> your fills, newest first
 //   DELETE /orders/:id                                                            -> 202, the engine decides
 export const ordersRoutes =
   ({ db, redis }: OrdersDeps): FastifyPluginAsync =>
@@ -51,10 +57,19 @@ export const ordersRoutes =
       },
     );
 
-    app.get<{ Querystring: { open?: boolean } }>(
+    app.get<{ Querystring: Page & { open?: boolean } }>(
       "/orders",
-      { schema: { querystring: { type: "object", properties: { open: { type: "boolean" } } } } },
-      async (req) => ({ orders: await listOrders(db, req.user!.userId, req.query.open ?? false) }),
+      { schema: { querystring: { type: "object", properties: { open: { type: "boolean" }, ...pageQuery } } } },
+      async (req) => {
+        const { open = false, ...page } = req.query;
+        return { orders: await listOrders(db, req.user!.userId, open, page) };
+      },
+    );
+
+    app.get<{ Querystring: Page & { symbol?: string } }>(
+      "/trades",
+      { schema: { querystring: { type: "object", properties: { symbol: { type: "string", maxLength: 16 }, ...pageQuery } } } },
+      async (req) => ({ trades: await listTrades(db, req.user!.userId, req.query) }),
     );
 
     app.delete<{ Params: { id: string } }>(

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
 import type { LightMyRequestResponse } from "fastify";
 import { buildApp } from "../../app.js";
 import { createDb } from "../../infra/db.js";
 import { createRedis } from "../../infra/redis.js";
+import { RedisKeys } from "../../shared/redisKeys.js";
 import type { AuthDeps } from "./auth.routes.js";
 import type { OAuthIdentity, OAuthProvider, ProviderName } from "./oauth.js";
 
@@ -17,6 +18,10 @@ const skip = await Promise.all([db.$queryRaw`SELECT 1`, redis.connect()])
   .catch(() => (redis.disconnect(), "postgres/redis not reachable: docker compose up -d"));
 
 const emails: string[] = [];
+// inject() always comes from 127.0.0.1, so back-to-back runs would trip the real 20/min login limit.
+before(async () => {
+  if (!skip) await redis.del(RedisKeys.rateLimit("login", "127.0.0.1"));
+});
 after(async () => {
   if (!skip) await db.user.deleteMany({ where: { email: { in: emails } } });
   redis.disconnect();
