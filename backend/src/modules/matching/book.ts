@@ -9,9 +9,11 @@ import { MarketPhases, type MarketPhase } from "../../shared/marketClock.js";
 //   -> OPEN     opening auction: one price that trades the most volume, then continuous matching
 //               (price-time priority, trade at the resting order's price)
 //   POST_CLOSE  fills only at the closing price (last trade of the day)
-//   -> next day unfilled orders EXPIRE, the day's bar is emitted
+//   CLOSED      the API takes no new orders; one already in flight is treated like POST_CLOSE
+//   -> next day the day's bar is emitted; resting LIMIT orders carry over
 // MARKET orders never rest after the auction: they fill up to their protection price, the rest is cancelled.
 // Self-trade: the newer of the two orders is cancelled.
+// Modify is a PLACE that replaces a resting order (loses time priority), see `replaces` in shared/events.ts.
 // Kafka is at-least-once, so a PLACE can arrive twice: the book ignores an order id it has already seen today.
 
 type Command = Payload<"orderCommands">;
@@ -61,7 +63,7 @@ export class Book {
   private bids: BookOrder[] = []; // best first: price desc, then seq asc
   private asks: BookOrder[] = []; // best first: price asc, then seq asc
   private seq = 0;
-  private seen = new Set<string>(); // order ids placed today
+  private seen = new Set<string>(); // order ids placed today, plus resting orders carried from earlier days
   private prevClose: number;
   private last: number | null = null;
   private bar: { open: number; high: number; low: number } | null = null;
@@ -104,6 +106,8 @@ export class Book {
         this.auction();
       } else if (this.phase === "OPEN") {
         this.phase = "POST_CLOSE";
+      } else if (this.phase === "POST_CLOSE") {
+        this.phase = "CLOSED";
       } else {
         this.endDay();
       }
@@ -124,9 +128,14 @@ export class Book {
     };
     if (cmd.tradingDay < this.day) return this.end(o, "EXPIRED", "DAY_END"); // arrived after its day ended
     if (cmd.tradingDay > this.day) this.advance(cmd.tradingDay, "PRE_OPEN");
+    if (cmd.replaces) {
+      const old = this.take(cmd.replaces.orderId, cmd.userId, cmd.replaces.remaining);
+      if (!old) return this.end(o, "REJECTED", "ORDER_CHANGED"); // filled, cancelled or part-filled since the request
+      this.end(old, "CANCELLED", "MODIFIED");
+    }
     if (this.phase === "PRE_OPEN") return this.rest(o);
 
-    const ended = this.matchIncoming(o, this.phase === "POST_CLOSE" ? this.closePrice : null);
+    const ended = this.matchIncoming(o, this.phase === "POST_CLOSE" || this.phase === "CLOSED" ? this.closePrice : null);
     if (ended || o.remaining === 0) return;
     if (o.type === "MARKET") this.end(o, "CANCELLED", "NO_LIQUIDITY");
     else this.rest(o);
@@ -236,10 +245,9 @@ export class Book {
   }
 
   private endDay() {
-    for (const o of [...this.bids, ...this.asks]) this.end(o, "EXPIRED", "DAY_END");
-    this.bids = [];
-    this.asks = [];
-    this.seen.clear(); // a late copy of an earlier day's order is expired again on arrival, same END id
+    // Resting LIMIT orders carry over to the next day. `seen` keeps only them: a late copy of one is ignored,
+    // a late copy of any other earlier-day order is expired on arrival (same END id, so a no-op downstream).
+    this.seen = new Set([...this.bids, ...this.asks].map((o) => o.orderId));
     if (this.bar) {
       const { open, high, low } = this.bar;
       this.out.push({ kind: "BAR", tradingDay: this.day, open: fromUnits(open), high: fromUnits(high), low: fromUnits(low), close: fromUnits(this.closePrice) });
@@ -257,6 +265,15 @@ export class Book {
       if (i >= 0) return this.end(side.splice(i, 1)[0]!, "CANCELLED", "USER");
     }
     // not in the book: already filled/ended, or it never reached us; settlement keeps the order's real state
+  }
+
+  // Removes a resting order only if it still has exactly `remaining` shares open (compare-and-swap for modify).
+  private take(orderId: string, userId: string, remaining: number): BookOrder | null {
+    for (const side of [this.bids, this.asks]) {
+      const i = side.findIndex((o) => o.orderId === orderId && o.userId === userId);
+      if (i >= 0) return side[i]!.remaining === remaining ? side.splice(i, 1)[0]! : null;
+    }
+    return null;
   }
 
   private rest(o: BookOrder) {

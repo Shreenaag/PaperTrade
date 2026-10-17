@@ -1,7 +1,7 @@
 # PaperTrade
 
 Paper-trading simulator (fake money, simulated prices) that demonstrates:
-**Kafka** for exchange events, **OAuth + OTP** for login, **Redis** for fast profile/session/price access,
+**Kafka** for exchange events, **OAuth (GitHub/Google)** for login, **Redis** for fast profile/session/price access,
 **Postgres** as the source of truth.
 
 Stack: Node.js 24 + TypeScript, Fastify 5, Prisma 7, kafkajs, ioredis, Zod. Modular monolith.
@@ -29,7 +29,7 @@ Optional:
 
 ## Market hours
 
-One **trading day every 10 minutes**, back-to-back; cash and holdings carry over between days.
+One **trading day every 6 min 20 s** (30 s pre-open, 5 min open, 30 s closing, 20 s closed), back-to-back; cash and holdings carry over between days.
 Days start on the :00, :10, :20 … minute boundaries (`src/shared/marketClock.ts`, `GET /market/session`).
 
 | Phase | Length | Prices | Orders |
@@ -43,28 +43,25 @@ The phase when an order is *matched* decides how it fills. The clock is wall-clo
 
 ## Auth (P1)
 
-OAuth (Google/GitHub) proves who you are, a 6-digit email OTP is the second step, then a Redis session cookie.
+Sign in with GitHub (or Google) and you're in: OAuth proves who you are, then a Redis session cookie.
+A new player completes a profile (name + unique @handle) before they can trade; a returning player goes straight to trading.
+(The email one-time code from the first version was removed on 2026-10-16 at the user's request; it is in git history.)
 
 ```
 GET  /auth/providers            enabled providers (those with credentials in .env)
 GET  /auth/:provider/login      -> provider consent screen (state + PKCE)
-GET  /auth/:provider/callback   -> user found/linked/created (+ ₹STARTING_CASH), OTP sent,
-                                   pending session cookie, redirect WEB_APP_URL/verify-otp
+GET  /auth/:provider/callback   -> user found/linked/created (+ ₹STARTING_CASH), 24h session cookie,
+                                   redirect WEB_APP_URL/profile (new player) or WEB_APP_URL/ (profile done)
                                    (failures: WEB_APP_URL/login?error=<reason>)
-POST /auth/otp/verify {code}    -> full 24h session (new id); 5 wrong tries = locked
-POST /auth/otp/resend           -> new code, 60s cooldown
 POST /auth/logout
-GET  /me                        profile (Redis cache-aside); 401 {error: UNAUTHENTICATED | OTP_REQUIRED}
+GET  /me                        profile (Redis cache-aside), incl. handle + profileComplete; 401 {error: UNAUTHENTICATED}
+PUT  /me/profile {displayName, handle}  -> profile complete; 409 HANDLE_TAKEN. POST /orders is 403 PROFILE_INCOMPLETE until then
 ```
 
 Setup: create an OAuth app (GitHub: Settings → Developer settings → OAuth Apps; Google: Cloud Console → Credentials),
-callback `http://localhost:3000/auth/<provider>/callback`, put the id/secret in `.env`. Without `SMTP_URL` the OTP
-is printed in the `npm run dev` log. Until the frontend exists (P5), finish the login from the browser console on
-`http://localhost:3000`: `fetch('/auth/otp/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code:'123456'})})`,
-then open `/me`.
+callback `http://localhost:3000/auth/<provider>/callback`, put the id/secret in `.env`.
 
 Protect any later route with `{ preHandler: requireAuth(redis) }` (`src/modules/auth/session.ts`); it sets `req.user`.
-The containerised backend runs with `NODE_ENV=production`, which requires `SMTP_URL`.
 
 ## Orders (P3a)
 
@@ -111,7 +108,7 @@ Storage stays small: Kafka topics keep 1 hour, published outbox rows are pruned 
             └──────┬──────────────────┬──────────────────────┬──────────┘
                    │                  │                      │
               Postgres            Redis                   Kafka
-          (source of truth)   (sessions, OTP,     market.prices.v1   key=symbol
+          (source of truth)   (sessions,          market.prices.v1   key=symbol
                               profile cache,      orders.commands.v1 key=symbol  (PLACE, CANCEL, CLOCK)
                               latest prices,      orders.updates.v1  key=userId
                               leaderboard)        orders.executions.v1 key=userId (FILL, END)
@@ -136,7 +133,7 @@ settlement writes `Trade`, updates `Account`/`Holding`/`LedgerEntry` (idempotent
 | Market calendar | 10-min days from a pure wall-clock function | Every process agrees on the phase with no coordination |
 | Topic versions | `.v1` suffix, payloads validated by Zod both ways | Breaking change = new topic |
 | OAuth | Store only `(provider, providerAccountId)`, never provider tokens | Identity only; nothing secret to leak |
-| Sessions/OTP | Redis with TTLs (`src/shared/redisKeys.ts`) | Fast, auto-expiring |
+| Sessions | Redis with TTLs (`src/shared/redisKeys.ts`) | Fast, auto-expiring |
 | Config | Zod-validated env, crash at startup if invalid | No half-configured server |
 
 ## Layout
@@ -153,7 +150,7 @@ backend/
   src/infra/                db (Prisma), redis, kafka clients
   src/shared/events.ts      Kafka topics + event contracts
   src/shared/redisKeys.ts   Redis key names + TTLs
-  src/shared/marketClock.ts 10-minute trading day: phases + fill mode per phase
+  src/shared/marketClock.ts 6 min 20 s trading day: phases + fill mode per phase
   src/modules/<feature>/    one folder per feature: health, auth, market, orders, matching, settlement, bots (portfolio next)
 ```
 
@@ -163,7 +160,7 @@ Schema changes go through `npm run db:migrate -- --name <change>`; never edit an
 ## Roadmap
 
 - **P0 Foundation** ✅ infra, data model, skeleton, health checks
-- **P1 Auth** ✅ OAuth (Google/GitHub) → OTP → Redis session
+- **P1 Auth** ✅ OAuth (Google/GitHub) → Redis session (email OTP removed in P5) → profile
 - **P2 Market data** ✅ hidden fair-value simulator (moves only in `OPEN`) that bots trade around
 - **P3 Trading** ✅ (P3a ✅ orders API, outbox relay, settlement · P3b ✅ matching engine · P3c ✅ bots): orders → order-book matching (opening auction, continuous, closing price, end-of-day expiry) → settlement via Kafka (+ outbox relay);
   traded price → `market.prices.v1` → Redis + `daily_bars`; dummy traders (`src/modules/bots`, `User.isBot`) place orders through the same path as players

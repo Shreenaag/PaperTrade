@@ -1,10 +1,13 @@
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { buildApp } from "./app.js";
 import { loadEnv } from "./config/env.js";
 import { createDb } from "./infra/db.js";
 import { createKafka, createProducer, ensureTopics } from "./infra/kafka.js";
 import { createRedis } from "./infra/redis.js";
-import { createOtpSender } from "./modules/auth/mailer.js";
 import { createProviders } from "./modules/auth/oauth.js";
+import { startLiveFeed } from "./modules/live/feed.js";
+import { createHub } from "./modules/live/hub.js";
 
 const env = loadEnv();
 
@@ -13,6 +16,8 @@ const redis = createRedis(env.REDIS_URL);
 const kafka = createKafka(env.KAFKA_BROKERS, env.KAFKA_CLIENT_ID);
 const producer = createProducer(kafka);
 const providers = createProviders(env);
+const hub = createHub();
+const webRoot = fileURLToPath(new URL("../../frontend/dist", import.meta.url)); // same depth from src/ and dist/
 
 let kafkaUp = false;
 producer.on(producer.events.CONNECT, () => (kafkaUp = true));
@@ -32,22 +37,23 @@ const app = buildApp({
     db,
     redis,
     providers,
-    sendOtp: createOtpSender(env.SMTP_URL, env.MAIL_FROM),
     config: {
       appBaseUrl: env.APP_BASE_URL,
       webAppUrl: env.WEB_APP_URL,
-      authSecret: env.AUTH_SECRET,
       startingCash: env.STARTING_CASH,
       secureCookies: env.APP_BASE_URL.startsWith("https://"),
     },
   },
   orders: { db, redis },
+  live: { redis, hub },
+  ...(existsSync(webRoot) && { webRoot }), // after `npm run build` in frontend/
 });
 
 // Fail fast: refuse to serve traffic until every dependency is reachable.
 await Promise.all([db.$connect(), redis.connect()]);
 await ensureTopics(kafka);
 await producer.connect();
+const stopLiveFeed = await startLiveFeed(kafka, hub);
 await app.listen({ host: env.HOST, port: env.PORT });
 app.log.info({ oauthProviders: Object.keys(providers) }, "auth ready");
 
@@ -57,7 +63,7 @@ async function shutdown(signal: string) {
   closing = true;
   app.log.info({ signal }, "shutting down");
   await app.close(); // stop accepting requests, finish in-flight ones
-  await Promise.allSettled([producer.disconnect(), redis.quit(), db.$disconnect()]);
+  await Promise.allSettled([stopLiveFeed(), producer.disconnect(), redis.quit(), db.$disconnect()]);
   process.exit(0);
 }
 process.on("SIGINT", () => void shutdown("SIGINT"));

@@ -103,7 +103,7 @@ test("HTTP: GET /trades needs a session; limit is validated", { skip }, async ()
   const u = await newUser();
   await seedHistory(u);
   const app = buildApp({ logLevel: "silent", checks: {}, orders: { db, redis } });
-  const sid = await createSession(redis, { userId: u, role: "USER", otpVerified: true });
+  const sid = await createSession(redis, { userId: u, role: "USER" });
   const get = (url: string, cookies: Record<string, string> = { [SESSION_COOKIE]: sid }) => app.inject({ method: "GET", url, cookies });
 
   assert.equal((await get("/trades", {})).statusCode, 401);

@@ -31,6 +31,8 @@ model User {
   avatarUrl   String?
   role        Role     @default(USER)
   isBot       Boolean  @default(false) // dummy trader (P3c): never logs in, skips per-user rate limits
+  handle             String?   @unique @db.VarChar(20) // P5: public @handle on the ranking, ^[a-z0-9_]{3,20}$
+  profileCompletedAt DateTime? // P5: set by PUT /me/profile; trading and the ranking need it
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

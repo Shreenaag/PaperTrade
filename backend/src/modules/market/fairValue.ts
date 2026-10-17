@@ -19,9 +19,15 @@ export function toTickString(price: number, tickSize: number): string {
   return (Math.max(1, Math.round(price / tickSize)) * tickSize).toFixed(4);
 }
 
-// Moves each instrument's fair value once a second during OPEN (frozen in PRE_OPEN / POST_CLOSE) and keeps it
+// Moves each instrument's fair value once a second during OPEN (frozen in PRE_OPEN / POST_CLOSE / CLOSED) and keeps it
 // in Redis for the bots. Resumes from Redis; after a Redis wipe, from the last daily close, else the seeded price.
-export async function startFairValue(db: Db, redis: Redis, tickSeconds = 1): Promise<() => void> {
+// nudge(symbol, fraction) moves one fair value at once (a player's order, see bots/strategies.ts impactOf).
+export interface FairValue {
+  stop(): void;
+  nudge(symbol: string, fraction: number): Promise<void>;
+}
+
+export async function startFairValue(db: Db, redis: Redis, tickSeconds = 1): Promise<FairValue> {
   const saved = await redis.hgetall(RedisKeys.fairValue);
   const instruments = await db.instrument.findMany({
     where: { isActive: true },
@@ -41,7 +47,15 @@ export async function startFairValue(db: Db, redis: Redis, tickSeconds = 1): Pro
     for (const s of state) s.price = stepFairValue(s.price, s.sigma, tickSeconds);
     save().catch((err) => console.error("fair-value save failed", err));
   }, tickSeconds * 1000);
-  return () => clearInterval(timer);
+  return {
+    stop: () => clearInterval(timer),
+    nudge: async (symbol, fraction) => {
+      const s = state.find((x) => x.symbol === symbol);
+      if (!s) return;
+      s.price *= 1 + fraction;
+      await redis.hset(RedisKeys.fairValue, symbol, toTickString(s.price, s.tick));
+    },
+  };
 }
 
 // Box-Muller; 1 - rand() keeps log() away from 0.

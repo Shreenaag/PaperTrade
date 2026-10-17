@@ -1,32 +1,20 @@
 import { randomBytes } from "node:crypto";
-import type { FastifyBaseLogger, FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync } from "fastify";
 import type { Db } from "../../infra/db.js";
 import { countHit, type Redis } from "../../infra/redis.js";
 import { LOGIN_PER_MINUTE_PER_IP } from "../../shared/limits.js";
 import { RedisKeys, RedisTtlSeconds } from "../../shared/redisKeys.js";
-import type { SendOtp } from "./mailer.js";
 import { pkcePair, type OAuthProviders, type ProviderName } from "./oauth.js";
-import { createOtpChallenge, deleteOtpChallenge, takeResendSlot, verifyOtp } from "./otp.js";
-import {
-  createSession,
-  deleteSession,
-  getSession,
-  requireAuth,
-  SESSION_COOKIE,
-  setSessionCookie,
-  updateSession,
-} from "./session.js";
-import { findOrCreateUser, getProfile } from "./users.js";
+import { createSession, deleteSession, requireAuth, SESSION_COOKIE, setSessionCookie } from "./session.js";
+import { findOrCreateUser, getProfile, HandleTakenError, updateProfile } from "./users.js";
 
 export interface AuthDeps {
   db: Db;
   redis: Redis;
   providers: OAuthProviders;
-  sendOtp: SendOtp;
   config: {
     appBaseUrl: string;
     webAppUrl: string;
-    authSecret: string;
     startingCash: string;
     secureCookies: boolean;
   };
@@ -36,12 +24,12 @@ const STATE_COOKIE = "oauth_state";
 
 // Login flow:
 //   GET  /auth/:provider/login     -> redirect to provider (state + PKCE)
-//   GET  /auth/:provider/callback  -> user found/created, OTP emailed, pending session cookie,
-//                                     redirect to WEB_APP_URL/verify-otp (or /login?error=...)
-//   POST /auth/otp/verify {code}   -> pending session swapped for a full one
+//   GET  /auth/:provider/callback  -> user found/created, session cookie, redirect to WEB_APP_URL/profile
+//                                     (new player) or WEB_APP_URL/ (profile done); failures: /login?error=...
+//   PUT  /me/profile {displayName, handle} -> profile complete (asked once, before the first trade)
 // Errors are { error: "CODE" }; the frontend switches on the code.
 export const authRoutes =
-  ({ db, redis, providers, sendOtp, config }: AuthDeps): FastifyPluginAsync =>
+  ({ db, redis, providers, config }: AuthDeps): FastifyPluginAsync =>
   async (app) => {
     const providerParam = {
       type: "object",
@@ -49,17 +37,6 @@ export const authRoutes =
       properties: { provider: { type: "string", enum: ["google", "github"] } },
     } as const;
     const callbackUrl = (p: ProviderName) => `${config.appBaseUrl}/auth/${p}/callback`;
-
-    const issueOtp = async (userId: string, email: string, log: FastifyBaseLogger) => {
-      const { challengeId, code } = await createOtpChallenge(redis, config.authSecret, userId);
-      await takeResendSlot(redis, userId); // starts the resend cooldown
-      try {
-        await sendOtp(email, code, log);
-      } catch (err) {
-        log.error({ err, userId }, "failed to send OTP"); // user can hit resend; don't fail the login
-      }
-      return challengeId;
-    };
 
     app.get("/auth/providers", async () => ({ providers: Object.keys(providers) }));
 
@@ -122,65 +99,15 @@ export const authRoutes =
 
         const user = await findOrCreateUser(db, identity, config.startingCash);
         await deleteSession(redis, req.cookies[SESSION_COOKIE]); // never reuse a session id across logins
-        const otpChallengeId = await issueOtp(user.id, user.email, req.log);
-        const sid = await createSession(redis, { userId: user.id, role: user.role, otpVerified: false, otpChallengeId });
-        setSessionCookie(reply, sid, config.secureCookies, RedisTtlSeconds.pendingSession);
-        return reply.redirect(`${config.webAppUrl}/verify-otp`);
+        const sid = await createSession(redis, { userId: user.id, role: user.role });
+        setSessionCookie(reply, sid, config.secureCookies, RedisTtlSeconds.session);
+        // A new player sets up their profile first; a returning one goes straight to trading.
+        return reply.redirect(`${config.webAppUrl}/${user.profileCompletedAt ? "" : "profile"}`);
       },
     );
-
-    app.post<{ Body: { code: string } }>(
-      "/auth/otp/verify",
-      {
-        schema: {
-          body: { type: "object", required: ["code"], properties: { code: { type: "string", maxLength: 6 } } },
-        },
-      },
-      async (req, reply) => {
-        const sid = req.cookies[SESSION_COOKIE];
-        const session = await getSession(redis, sid);
-        if (!session || !sid) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-        if (session.otpVerified) return { status: "authenticated" };
-        if (!session.otpChallengeId) return reply.code(400).send({ error: "OTP_EXPIRED" });
-
-        const result = await verifyOtp(redis, config.authSecret, session.otpChallengeId, session.userId, req.body.code);
-        if (result === "invalid") return reply.code(400).send({ error: "OTP_INVALID" });
-        if (result !== "ok") {
-          const { otpChallengeId: _, ...rest } = session;
-          await updateSession(redis, sid, rest); // challenge is gone; user must resend
-          return reply.code(400).send({ error: result === "locked" ? "OTP_LOCKED" : "OTP_EXPIRED" });
-        }
-
-        // New id on privilege change (session fixation defence).
-        await deleteSession(redis, sid);
-        const fullSid = await createSession(redis, { userId: session.userId, role: session.role, otpVerified: true });
-        setSessionCookie(reply, fullSid, config.secureCookies, RedisTtlSeconds.session);
-        return { status: "authenticated" };
-      },
-    );
-
-    app.post("/auth/otp/resend", async (req, reply) => {
-      const sid = req.cookies[SESSION_COOKIE];
-      const session = await getSession(redis, sid);
-      if (!session || !sid) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-      if (session.otpVerified) return reply.code(409).send({ error: "ALREADY_VERIFIED" });
-      if (!(await takeResendSlot(redis, session.userId))) {
-        return reply.code(429).send({ error: "OTP_COOLDOWN", retryAfterSeconds: RedisTtlSeconds.otpResendCooldown });
-      }
-      const profile = await getProfile(db, redis, session.userId);
-      if (!profile) return reply.code(401).send({ error: "UNAUTHENTICATED" });
-
-      await deleteOtpChallenge(redis, session.otpChallengeId);
-      const { challengeId, code } = await createOtpChallenge(redis, config.authSecret, session.userId);
-      await updateSession(redis, sid, { ...session, otpChallengeId: challengeId });
-      await sendOtp(profile.email, code, req.log);
-      return reply.code(204).send();
-    });
 
     app.post("/auth/logout", async (req, reply) => {
-      const sid = req.cookies[SESSION_COOKIE];
-      const session = await getSession(redis, sid);
-      await Promise.all([deleteSession(redis, sid), deleteOtpChallenge(redis, session?.otpChallengeId)]);
+      await deleteSession(redis, req.cookies[SESSION_COOKIE]);
       reply.clearCookie(SESSION_COOKIE, { path: "/" });
       return reply.code(204).send();
     });
@@ -190,4 +117,32 @@ export const authRoutes =
       if (!profile) return reply.code(401).send({ error: "UNAUTHENTICATED" });
       return profile;
     });
+
+    // PUT /me/profile {displayName, handle} -> 200 profile | 409 HANDLE_TAKEN. Required once before trading (P5).
+    app.put<{ Body: { displayName: string; handle: string } }>(
+      "/me/profile",
+      {
+        preHandler: requireAuth(redis),
+        schema: {
+          body: {
+            type: "object",
+            additionalProperties: false,
+            required: ["displayName", "handle"],
+            properties: {
+              displayName: { type: "string", minLength: 1, maxLength: 40, pattern: "\\S" },
+              handle: { type: "string", pattern: "^[a-z0-9_]{3,20}$" },
+            },
+          },
+        },
+      },
+      async (req, reply) => {
+        try {
+          const profile = await updateProfile(db, redis, req.user!.userId, req.body.displayName.trim(), req.body.handle);
+          return profile ?? reply.code(401).send({ error: "UNAUTHENTICATED" });
+        } catch (err) {
+          if (err instanceof HandleTakenError) return reply.code(409).send({ error: "HANDLE_TAKEN" });
+          throw err;
+        }
+      },
+    );
   };

@@ -79,6 +79,7 @@ test("portfolio values positions at last price with fallbacks", { skip }, async 
     unrealizedPnl: "50.0000",
     totalPnl: "75.5000",
     returnPct: "-0.80",
+    invested: "1000000.0000",
   });
 });
 
@@ -120,7 +121,7 @@ test("zero avgCost doesn't divide by zero", { skip }, async () => {
 test("HTTP: 401 without session, 404 NO_ACCOUNT, 200 with body", { skip }, async () => {
   const app = buildApp({ logLevel: "silent", checks: {}, orders: { db, redis } });
   const get = (sid?: string) => app.inject({ method: "GET", url: "/portfolio", cookies: sid ? { [SESSION_COOKIE]: sid } : {} });
-  const session = async (userId: string) => createSession(redis, { userId, role: "USER", otpVerified: true });
+  const session = async (userId: string) => createSession(redis, { userId, role: "USER" });
 
   assert.equal((await get()).statusCode, 401);
   const noAccount = await get(await session(await newUser(null)));

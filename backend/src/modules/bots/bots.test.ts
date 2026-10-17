@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
 import { Prisma } from "../../generated/prisma/client.js";
 import { createDb } from "../../infra/db.js";
-import { BOT_CASH, topUp } from "./bots.js";
+import { BOT_CASH, newPlayerOrders, topUp } from "./bots.js";
 
 // Integration test: real Postgres from docker compose, a throwaway instrument and bot. Skipped when it isn't running.
 const db = createDb(process.env["DATABASE_URL"] ?? "postgresql://localhost/none");
@@ -50,4 +50,22 @@ test("top-up creates the holding if the bot has none", { skip }, async () => {
   await topUp(db, { userId: user.id, symbol, shares: 500, initialPrice: new Prisma.Decimal(100) });
   const holding = await db.holding.findUniqueOrThrow({ where: { userId_symbol: { userId: user.id, symbol } } });
   assert.deepEqual([holding.quantity, holding.avgCost.toString()], [500, "100"]);
+});
+
+test("newPlayerOrders returns players' orders placed after the cursor, never bots'", { skip }, async () => {
+  const mk = async (isBot: boolean) => {
+    const u = await db.user.create({ data: { email: `p-${randomUUID()}@example.test`, displayName: "P", isBot, account: { create: { cash: "1000" } } } });
+    userIds.push(u.id);
+    return u.id;
+  };
+  const [player, bot] = [await mk(false), await mk(true)];
+  const order = (userId: string, createdAt: Date) =>
+    db.order.create({ data: { userId, symbol, side: "BUY", type: "LIMIT", quantity: 2, limitPrice: "101", status: "OPEN", tradingDay: 1, createdAt } });
+  const since = new Date(Date.now() - 60_000);
+  await order(player, new Date(since.getTime() - 1000)); // before the cursor
+  const fresh = await order(player, new Date());
+  await order(bot, new Date());
+
+  const found = (await newPlayerOrders(db, since)).filter((o) => o.symbol === symbol);
+  assert.deepEqual(found.map((o) => [o.side, o.quantity, o.limitPrice?.toString(), o.createdAt.getTime()]), [["BUY", 2, "101", fresh.createdAt.getTime()]]);
 });

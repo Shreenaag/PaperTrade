@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decide, sizeFor, type BotView } from "./strategies.js";
+import { decide, impactOf, sizeFor, type BotView } from "./strategies.js";
 
 const view = (over: Partial<BotView>): BotView => ({
   kind: "MARKET_MAKER",
@@ -9,6 +9,7 @@ const view = (over: Partial<BotView>): BotView => ({
   fair: 450,
   last: 450,
   ref: null,
+  flow: null,
   tick: 0.05,
   lot: 1,
   open: [],
@@ -63,4 +64,20 @@ test("order size is whole lots, at least one", () => {
   assert.equal(sizeFor(25_000, 450, 1), 56);
   assert.equal(sizeFor(25_000, 450, 10), 60);
   assert.equal(sizeFor(25_000, 100_000, 1), 1);
+});
+
+test("a player's order moves the fair value: 3% per ₹1 lakh, capped at 8%", () => {
+  assert.equal(impactOf("BUY", 100_000), 0.03);
+  assert.equal(impactOf("SELL", 50_000), -0.015);
+  assert.equal(impactOf("BUY", 10_000_000), 0.08);
+});
+
+test("player flow: momentum trades with the player on every tick", () => {
+  const plan = decide(view({ kind: "MOMENTUM", flow: "SELL", ref: 450, last: 450 }));
+  assert.deepEqual(plan.place, [{ symbol: "ITC", side: "SELL", type: "MARKET", quantity: 111 }]);
+});
+
+test("player flow: noise picks the player's side 3 times in 4", () => {
+  assert.equal(decide(view({ kind: "NOISE", flow: "BUY" }), seq(0.6, 0.1)).place[0]!.side, "BUY");
+  assert.equal(decide(view({ kind: "NOISE", flow: "BUY" }), seq(0.8, 0.1)).place[0]!.side, "SELL");
 });

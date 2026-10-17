@@ -5,10 +5,10 @@ import { buildApp } from "../../app.js";
 import { createDb } from "../../infra/db.js";
 import { createRedis } from "../../infra/redis.js";
 import { makeEvent, type Payload } from "../../shared/events.js";
-import { sessionAt } from "../../shared/marketClock.js";
+import { DAY_SECONDS, dayStartsAt, sessionAt } from "../../shared/marketClock.js";
 import { createSession, SESSION_COOKIE } from "../auth/session.js";
 import { applyExecution } from "../settlement/settlement.js";
-import { cancelOrder, OrderError, placeOrder } from "./orders.service.js";
+import { cancelOrder, modifyOrder, OrderError, placeOrder } from "./orders.service.js";
 
 // Integration test: real Postgres + Redis from docker compose, a throwaway instrument priced at 100.
 // The matching engine is faked by hand-made execution events. Skipped when the containers aren't running.
@@ -34,9 +34,9 @@ after(async () => {
   await db.$disconnect();
 });
 
-async function newTrader(cash = "100000", shares = 0) {
+async function newTrader(cash = "100000", shares = 0, profileComplete = true) {
   const user = await db.user.create({
-    data: { email: `t-${randomUUID()}@example.test`, displayName: "Trader", account: { create: { cash } } },
+    data: { email: `t-${randomUUID()}@example.test`, displayName: "Trader", account: { create: { cash } }, ...(profileComplete && { profileCompletedAt: new Date() }) },
   });
   userIds.push(user.id);
   if (shares) await db.holding.create({ data: { userId: user.id, symbol, quantity: shares, avgCost: "90" } });
@@ -136,7 +136,7 @@ test("sell fill credits proceeds minus fee and books realized P&L", { skip }, as
 test("HTTP: orders need a verified session; bad bodies are rejected", { skip }, async () => {
   const t = await newTrader();
   const app = buildApp({ logLevel: "silent", checks: {}, orders: { db, redis } });
-  const sid = await createSession(redis, { userId: t.userId, role: "USER", otpVerified: true });
+  const sid = await createSession(redis, { userId: t.userId, role: "USER" });
   const post = (body: object, cookies: Record<string, string> = { [SESSION_COOKIE]: sid }) =>
     app.inject({ method: "POST", url: "/orders", cookies, payload: body });
 
@@ -148,10 +148,36 @@ test("HTTP: orders need a verified session; bad bodies are rejected", { skip }, 
 
   const list = await app.inject({ method: "GET", url: "/orders?open=true", cookies: { [SESSION_COOKIE]: sid } });
   assert.equal(list.json().orders.length, 1);
+
+  const newcomer = await newTrader("100000", 0, false);
+  const newSid = await createSession(redis, { userId: newcomer.userId, role: "USER" });
+  const blocked = await post({ symbol, side: "BUY", type: "MARKET", quantity: 1 }, { [SESSION_COOKIE]: newSid });
+  assert.deepEqual([blocked.statusCode, blocked.json()], [403, { error: "PROFILE_INCOMPLETE" }]);
   await app.close();
 });
 
 test("execution for an order that no longer exists is skipped, not retried forever", { skip }, async () => {
   const ev = makeEvent("executions", { kind: "END", orderId: randomUUID(), userId: randomUUID(), status: "EXPIRED", reason: "DAY_END" });
   assert.equal(await applyExecution(db, ev), false);
+});
+
+test("modify queues a replacing PLACE; the new order holds its own cash until the old one ends", { skip }, async () => {
+  const t = await newTrader("2000");
+  const old = await placeOrder(db, redis, t, { symbol, side: "BUY", type: "LIMIT", quantity: 10, limitPrice: "100" });
+  const next = await modifyOrder(db, redis, t.userId, old.id, { quantity: 10, limitPrice: "99" });
+  const cmd = await db.outboxEvent.findFirstOrThrow({ where: { key: symbol, payload: { path: ["payload", "orderId"], equals: next.id } } });
+  assert.deepEqual((cmd.payload as { payload: { replaces: unknown } }).payload.replaces, { orderId: old.id, remaining: 10 });
+
+  // the engine accepted it: the old order ends and releases its hold, the new one's stays
+  await applyExecution(db, makeEvent("executions", { kind: "END", orderId: old.id, userId: t.userId, status: "CANCELLED", reason: "MODIFIED" }));
+  assert.equal((await account(t.userId)).reservedCash.toString(), "990.297"); // 10 x 99 x 1.0003
+
+  await rejects(modifyOrder(db, redis, t.userId, old.id, { quantity: 10, limitPrice: "98" }), "ORDER_CLOSED");
+  await rejects(modifyOrder(db, redis, t.userId, next.id, { quantity: 20, limitPrice: "99" }), "INSUFFICIENT_CASH");
+});
+
+test("no new orders during the CLOSED pause between days", { skip }, async () => {
+  const t = await newTrader();
+  const closed = new Date(dayStartsAt(sessionAt().tradingDay).getTime() + (DAY_SECONDS - 5) * 1000);
+  await rejects(placeOrder(db, redis, t, { symbol, side: "BUY", type: "LIMIT", quantity: 1, limitPrice: "100" }, closed), "MARKET_CLOSED");
 });

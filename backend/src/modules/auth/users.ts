@@ -10,6 +10,8 @@ export interface Profile {
   avatarUrl: string | null;
   role: "USER" | "ADMIN";
   createdAt: string;
+  handle: string | null;
+  profileComplete: boolean; // P5: false until PUT /me/profile; the UI asks for it first, trading needs it
 }
 
 // Login = find by OAuth identity, else link to the user with the same (provider-verified) email,
@@ -58,10 +60,25 @@ export async function getProfile(db: Db, redis: Redis, userId: string): Promise<
 
   const u = await db.user.findUnique({
     where: { id: userId },
-    select: { id: true, email: true, displayName: true, avatarUrl: true, role: true, createdAt: true },
+    select: { id: true, email: true, displayName: true, avatarUrl: true, role: true, createdAt: true, handle: true, profileCompletedAt: true },
   });
   if (!u) return null;
-  const profile: Profile = { ...u, createdAt: u.createdAt.toISOString() };
+  const { profileCompletedAt, ...rest } = u;
+  const profile: Profile = { ...rest, createdAt: u.createdAt.toISOString(), profileComplete: profileCompletedAt !== null };
   await redis.set(key, JSON.stringify(profile), "EX", RedisTtlSeconds.userProfile);
   return profile;
+}
+
+export class HandleTakenError extends Error {}
+
+// Completes (or edits) the public profile. The handle is unique; the cached profile is dropped so /me shows the change.
+export async function updateProfile(db: Db, redis: Redis, userId: string, displayName: string, handle: string): Promise<Profile | null> {
+  try {
+    await db.user.update({ where: { id: userId }, data: { displayName, handle, profileCompletedAt: new Date() } });
+  } catch (err) {
+    if ((err as { code?: string }).code === "P2002") throw new HandleTakenError();
+    throw err;
+  }
+  await redis.del(RedisKeys.userProfile(userId));
+  return getProfile(db, redis, userId);
 }

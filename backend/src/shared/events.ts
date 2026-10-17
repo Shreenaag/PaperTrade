@@ -11,7 +11,7 @@ import { MarketPhases } from "./marketClock.js";
 // Events that must stay in order share a topic: PLACE + CANCEL (a cancel never overtakes its order),
 // FILL + END (an order's reservation is released only after its last fill).
 //
-// Retention is short (space): the matcher only replays the current 10-minute trading day, and
+// Retention is short (space): the matcher only replays the current 6-minute trading day, and
 // Postgres (outbox) holds anything not yet published.
 //
 // Every event carries its tradingDay (src/shared/marketClock.ts). Price ticks also carry the phase:
@@ -46,6 +46,9 @@ export const Topics = {
         limitPrice: decimal.nullable(), // LIMIT only
         protectionPrice: decimal.nullable(), // MARKET only: worst price it may fill at
         tradingDay,
+        // Modify = replace: the engine swaps orderId out for this order only if it still rests with exactly
+        // `remaining` shares open; otherwise this order is rejected and the old one is left alone.
+        replaces: z.object({ orderId: z.uuid(), remaining: z.number().int().positive() }).optional(),
       }),
       z.object({ kind: z.literal("CANCEL"), orderId: z.uuid(), userId: z.uuid(), symbol: z.string() }),
       // Phase changes go through the log too, so replaying it rebuilds exactly the same book.

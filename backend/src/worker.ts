@@ -3,6 +3,7 @@ import { createDb } from "./infra/db.js";
 import { createKafka, createProducer, ensureTopics } from "./infra/kafka.js";
 import { createRedis, tryLock } from "./infra/redis.js";
 import { startBots } from "./modules/bots/bots.js";
+import { startLeaderboard } from "./modules/leaderboard/leaderboard.js";
 import { startFairValue } from "./modules/market/fairValue.js";
 import { startMatching } from "./modules/matching/matching.js";
 import { startRelay } from "./modules/orders/outbox.js";
@@ -45,14 +46,16 @@ const renewal = setInterval(async () => {
 await ensureTopics(kafka);
 await producer.connect();
 
+const fairValue = await startFairValue(db, redis);
 stops.push(
-  await startFairValue(db, redis),
+  fairValue.stop,
   startRelay(db, producer),
   await startSettlement(kafka, db),
   await startMatching(kafka, producer, db, redis),
-  await startBots(db, redis), // last: stopped first, so its in-flight orders still reach the outbox
+  startLeaderboard(db, redis),
+  await startBots(db, redis, fairValue.nudge), // last: stopped first, so its in-flight orders still reach the outbox
 );
-console.log("worker ready: fair-value, outbox relay, settlement, matching, bots");
+console.log("worker ready: fair-value, outbox relay, settlement, matching, leaderboard, bots");
 
 let closing = false;
 async function shutdown() {
