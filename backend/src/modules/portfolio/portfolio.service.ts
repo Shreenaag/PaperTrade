@@ -65,6 +65,7 @@ export async function getPortfolio(db: Db, redis: Redis, userId: string) {
       unrealizedPnl: money(unrealized),
       totalPnl: money(realized.add(unrealized)),
       returnPct: pct(equity.sub(invested), invested),
+      invested: money(invested), // lets the UI recompute returnPct live from price ticks
     },
   };
 }

@@ -92,7 +92,7 @@ test("PRE_OPEN queues; the opening auction trades the most volume at one price",
   assert.equal(book.phase, "OPEN");
 });
 
-test("POST_CLOSE fills only at the closing price; day end expires the rest and emits the bar", () => {
+test("POST_CLOSE fills only at the closing price; resting orders carry over to the next day; the bar is emitted", () => {
   const book = openBook();
   book.handle(limit(A, "SELL", 5, "100"), AT);
   book.handle(limit(B, "BUY", 5, "100"), AT); // last trade 100 = close
@@ -102,10 +102,25 @@ test("POST_CLOSE fills only at the closing price; day end expires the rest and e
   assert.deepEqual(fills(ev), [["BUY", 3, "100.0000"], ["SELL", 3, "100.0000"]]); // at close, not 99
   assert.deepEqual(fills(book.handle(limit(C, "BUY", 1, "98"), AT)), []); // below close: rests
 
+  book.handle(clock("CLOSED"), AT);
+  assert.deepEqual(fills(book.handle(limit(B, "BUY", 1, "105"), AT)), [["BUY", 1, "100.0000"], ["SELL", 1, "100.0000"]], "an order in flight at CLOSED still fills at the close");
   const next = book.handle(clock("PRE_OPEN", DAY + 1), AT);
-  assert.deepEqual(ends(next), [["EXPIRED", "DAY_END"], ["EXPIRED", "DAY_END"]]);
+  assert.deepEqual(ends(next), [], "A's 1 left at 99 and C's bid at 98 stay in the book");
   assert.deepEqual(next.find((e) => e.kind === "BAR"), { kind: "BAR", tradingDay: DAY, open: "100.0000", high: "100.0000", low: "100.0000", close: "100.0000" });
   assert.equal(book.day, DAY + 1);
+  assert.equal(book.openOrders, 2);
+
+  book.handle(clock("OPEN", DAY + 1), AT);
+  assert.deepEqual(fills(book.handle(limit(B, "BUY", 2, "99", DAY + 1), AT)), [["BUY", 1, "99.0000"], ["SELL", 1, "99.0000"]], "a carried order fills the next day");
+});
+
+test("a late duplicate of a carried resting order is ignored, not expired", () => {
+  const book = openBook();
+  const resting = limit(A, "BUY", 5, "99");
+  book.handle(resting, AT);
+  book.handle(clock("PRE_OPEN", DAY + 1), AT);
+  assert.deepEqual(book.handle(resting, AT), []);
+  assert.equal(book.openOrders, 1);
 });
 
 test("cancel removes a resting order; an order from a finished day is expired on arrival", () => {
@@ -137,4 +152,31 @@ test("replay is deterministic: same commands -> identical events and ids", () =>
     return commands.flatMap((c) => book.handle(c, AT));
   };
   assert.deepEqual(run(), run());
+});
+
+const place = (c: Command) => c as Extract<Command, { kind: "PLACE" }>;
+const replacing = (old: Command, next: Command, remaining: number): Command => ({ ...place(next), replaces: { orderId: place(old).orderId, remaining } });
+
+test("modify swaps an untouched resting order and sends it to the back of the queue", () => {
+  const book = openBook();
+  const old = limit(A, "BUY", 10, "99");
+  book.handle(old, AT);
+  const b = limit(B, "BUY", 5, "99");
+  book.handle(b, AT);
+  const next = limit(A, "BUY", 6, "99");
+  assert.deepEqual(ends(book.handle(replacing(old, next, 10), AT)), [["CANCELLED", "MODIFIED"]]);
+  assert.equal(book.openOrders, 2);
+  const ev = book.handle(limit(C, "SELL", 5, "99"), AT);
+  const buyer = ev.find((e) => e.kind === "EXEC" && e.payload.kind === "FILL" && e.payload.side === "BUY");
+  assert.equal(buyer?.kind === "EXEC" && buyer.payload.orderId, place(b).orderId, "B was ahead of the modified order");
+});
+
+test("modify is rejected when the order filled in the meantime; the old order keeps resting", () => {
+  const book = openBook();
+  const old = limit(A, "BUY", 10, "99");
+  book.handle(old, AT);
+  book.handle(limit(C, "SELL", 4, "99"), AT); // 4 fill before the modify arrives
+  assert.deepEqual(ends(book.handle(replacing(old, limit(A, "BUY", 10, "98"), 10), AT)), [["REJECTED", "ORDER_CHANGED"]]);
+  assert.equal(book.openOrders, 1);
+  assert.deepEqual(ends(book.handle(replacing(old, limit(A, "BUY", 10, "98"), 99), AT)), [["REJECTED", "ORDER_CHANGED"]]);
 });

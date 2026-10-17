@@ -4,3 +4,5 @@ dist/
 *.log
 backend/src/generated/
 docs
+.superpowers
+.playwright-mcp

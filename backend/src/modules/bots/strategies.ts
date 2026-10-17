@@ -8,6 +8,9 @@ import type { PlaceOrderInput } from "../orders/orders.service.js";
 //                 its quotes give the opening auction and players someone to trade with
 //   NOISE         random small orders near fair value (OPEN): volume and a bit of randomness
 //   MOMENTUM      chases the traded price when it moved since its last look (OPEN): trends players can ride
+// Player flow (P5 feedback: the market must react to the player): right after a player's order, its stock's bots
+// trade WITH the player for a while (momentum every tick, noise mostly on the player's side), and the hidden fair
+// value jumps by impactOf(); the market maker re-quotes around it, so the player's order finds a counterparty.
 
 export const BotKinds = ["MARKET_MAKER", "NOISE", "MOMENTUM"] as const;
 export type BotKind = (typeof BotKinds)[number];
@@ -20,7 +23,17 @@ export const BotRules = {
   momentumValue: 50_000,
   momentumTrigger: 0.002, // a 0.2% move since the last look triggers a MARKET order
   maxOpen: 3, // noise/momentum orders left resting before the oldest is cancelled
+  impactPerLakh: 0.03, // a player's ₹1,00,000 order moves the fair value 3% (dramatic, by request)...
+  impactCap: 0.08, // ...but one order moves it at most 8%
+  flowSeconds: 15, // how long the stock's bots follow the player's order
+  noiseWithFlow: 0.75, // share of noise orders on the player's side while following
 } as const;
+
+// Signed fraction a player's order moves the fair value by.
+export function impactOf(side: "BUY" | "SELL", value: number): number {
+  const size = Math.min(BotRules.impactCap, (BotRules.impactPerLakh * value) / 100_000);
+  return side === "BUY" ? size : -size;
+}
 
 export interface OpenOrder {
   id: string;
@@ -35,6 +48,7 @@ export interface BotView {
   fair: number;
   last: number; // last traded price (previous close before the first trade)
   ref: number | null; // MOMENTUM: last price at its previous look
+  flow: "BUY" | "SELL" | null; // a player just traded this stock in this direction
   tick: number;
   lot: number;
   open: OpenOrder[]; // oldest first, pending cancels already removed
@@ -46,7 +60,7 @@ export interface Plan {
 }
 
 export function decide(v: BotView, rand: () => number = Math.random): Plan {
-  if (v.kind === "MARKET_MAKER") return v.phase === "POST_CLOSE" ? idle : quote(v);
+  if (v.kind === "MARKET_MAKER") return v.phase === "PRE_OPEN" || v.phase === "OPEN" ? quote(v) : idle;
   if (v.phase !== "OPEN") return idle;
   return v.kind === "NOISE" ? noise(v, rand) : momentum(v);
 }
@@ -72,7 +86,8 @@ function quote(v: BotView): Plan {
 }
 
 function noise(v: BotView, rand: () => number): Plan {
-  const side = rand() < 0.5 ? "BUY" : "SELL";
+  const opposite = (s: "BUY" | "SELL") => (s === "BUY" ? "SELL" : "BUY");
+  const side = v.flow ? (rand() < BotRules.noiseWithFlow ? v.flow : opposite(v.flow)) : rand() < 0.5 ? "BUY" : "SELL";
   const quantity = sizeFor(BotRules.noiseValue, v.fair, v.lot);
   const order: PlaceOrderInput =
     rand() < 0.5
@@ -82,6 +97,10 @@ function noise(v: BotView, rand: () => number): Plan {
 }
 
 function momentum(v: BotView): Plan {
+  if (v.flow) {
+    const quantity = sizeFor(BotRules.momentumValue, v.last, v.lot);
+    return { cancel: oldestOverCap(v.open), place: [{ symbol: v.symbol, side: v.flow, type: "MARKET", quantity }] };
+  }
   if (v.ref === null) return idle;
   const move = (v.last - v.ref) / v.ref;
   if (Math.abs(move) < BotRules.momentumTrigger) return idle;

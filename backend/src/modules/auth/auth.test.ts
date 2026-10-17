@@ -9,7 +9,7 @@ import { RedisKeys } from "../../shared/redisKeys.js";
 import type { AuthDeps } from "./auth.routes.js";
 import type { OAuthIdentity, OAuthProvider, ProviderName } from "./oauth.js";
 
-// Integration test: real Postgres + Redis from docker compose, fake OAuth provider and mailer.
+// Integration test: real Postgres + Redis from docker compose, fake OAuth provider.
 // Skipped (not failed) when the containers aren't running.
 const db = createDb(process.env["DATABASE_URL"] ?? "postgresql://localhost/none");
 const redis = createRedis(process.env["REDIS_URL"] ?? "redis://localhost:6379");
@@ -27,8 +27,6 @@ after(async () => {
   redis.disconnect();
   await db.$disconnect();
 });
-
-const sent: string[] = []; // OTP codes "emailed"
 
 function newIdentity(provider: ProviderName = "github", email = `t-${randomUUID()}@example.test`): OAuthIdentity {
   emails.push(email);
@@ -56,11 +54,9 @@ function makeApp(providers: AuthDeps["providers"] = { github: fakeProvider(() =>
       db,
       redis,
       providers,
-      sendOtp: async (_email, code) => void sent.push(code),
       config: {
         appBaseUrl: "http://api.test",
         webAppUrl: "http://web.test",
-        authSecret: "x".repeat(32),
         startingCash: "1000000",
         secureCookies: false,
       },
@@ -72,49 +68,57 @@ const app = makeApp();
 const cookie = (res: LightMyRequestResponse, name: string) =>
   (res.cookies as { name: string; value: string }[]).find((c) => c.name === name)?.value;
 
-async function oauthLogin(provider: ProviderName = "github", code = "ok") {
+async function oauthLogin(provider: ProviderName = "github", code = "ok", sid?: string) {
   const start = await app.inject({ url: `/auth/${provider}/login` });
   const state = new URL(start.headers.location as string).searchParams.get("state")!;
   const res = await app.inject({
     url: `/auth/${provider}/callback?code=${code}&state=${state}`,
-    cookies: { oauth_state: cookie(start, "oauth_state")! },
+    cookies: { oauth_state: cookie(start, "oauth_state")!, ...(sid && { sid }) },
   });
-  return { res, sid: cookie(res, "sid")!, code: sent.at(-1)! };
+  return { res, sid: cookie(res, "sid")! };
 }
 
-const verify = (sid: string, code: string) =>
-  app.inject({ method: "POST", url: "/auth/otp/verify", cookies: { sid }, payload: { code } });
 const me = (sid: string) => app.inject({ url: "/me", cookies: { sid } });
-const wrong = (code: string) => String((Number(code) + 1) % 1_000_000).padStart(6, "0");
+const putProfile = (sid: string | undefined, payload: object) =>
+  app.inject({ method: "PUT", url: "/me/profile", cookies: sid ? { sid } : {}, payload });
 
-test("full login: OAuth -> OTP -> session -> /me, and sign-up grants starting cash", { skip }, async () => {
-  const { res, sid, code } = await oauthLogin();
+async function loggedIn() {
+  identity = newIdentity();
+  return (await oauthLogin()).sid;
+}
+
+test("sign-up: GitHub alone signs you in, grants starting cash, and sends you to the profile page", { skip }, async () => {
+  identity = newIdentity();
+  const { res, sid } = await oauthLogin();
   assert.equal(res.statusCode, 302);
-  assert.equal(res.headers.location, "http://web.test/verify-otp");
+  assert.equal(res.headers.location, "http://web.test/profile");
 
-  assert.deepEqual((await me(sid)).json(), { error: "OTP_REQUIRED" });
-  assert.deepEqual((await verify(sid, wrong(code))).json(), { error: "OTP_INVALID" });
-
-  const ok = await verify(sid, code);
-  assert.equal(ok.statusCode, 200);
-  const fullSid = cookie(ok, "sid")!;
-  assert.notEqual(fullSid, sid, "session id rotates after OTP");
-
-  const profile = await me(fullSid);
+  const profile = await me(sid);
   assert.equal(profile.statusCode, 200);
-  assert.equal(profile.json().email, identity.email);
-  assert.equal((await me(sid)).statusCode, 401, "pending session is gone");
+  assert.deepEqual([profile.json().email, profile.json().profileComplete], [identity.email, false]);
 
   const user = await db.user.findUniqueOrThrow({ where: { email: identity.email }, include: { account: true, ledger: true } });
   assert.equal(user.account!.cash.toString(), "1000000");
   assert.deepEqual(user.ledger.map((l) => [l.type, l.amount.toString()]), [["INITIAL_GRANT", "1000000"]]);
 });
 
+test("a returning player with a finished profile goes straight to trading, with a fresh session id", { skip }, async () => {
+  const first = await loggedIn();
+  assert.equal((await putProfile(first, { displayName: "Back Again", handle: `b_${randomUUID().slice(0, 8)}` })).statusCode, 200);
+
+  const again = await oauthLogin("github", "ok", first);
+  assert.equal(again.res.headers.location, "http://web.test/");
+  assert.notEqual(again.sid, first, "never reuse a session id across logins");
+  assert.equal((await me(first)).statusCode, 401, "the old session is gone");
+  assert.equal((await me(again.sid)).statusCode, 200);
+});
+
 test("returning user is not re-created; same verified email on another provider links to the same user", { skip }, async () => {
+  identity = newIdentity();
   await oauthLogin();
   googleIdentity = { ...newIdentity("google"), email: identity.email };
   await oauthLogin("google");
-
+  await oauthLogin();
   const user = await db.user.findUniqueOrThrow({ where: { email: identity.email }, include: { oauthAccounts: true, ledger: true } });
   assert.deepEqual(user.oauthAccounts.map((a) => a.provider).sort(), ["github", "google"]);
   assert.equal(user.ledger.length, 1, "cash granted once");
@@ -134,26 +138,10 @@ test("provider failure and user denial redirect with an error", { skip }, async 
   assert.equal(denied.headers.location, "http://web.test/login?error=oauth_denied");
 });
 
-test("OTP locks after 5 wrong attempts, even the right code then fails", { skip }, async () => {
-  identity = newIdentity();
-  const { sid, code } = await oauthLogin();
-  for (let i = 1; i < 5; i++) assert.equal((await verify(sid, wrong(code))).json().error, "OTP_INVALID");
-  assert.equal((await verify(sid, wrong(code))).json().error, "OTP_LOCKED");
-  assert.equal((await verify(sid, code)).json().error, "OTP_EXPIRED");
-});
-
-test("resend has a cooldown", { skip }, async () => {
-  const { sid } = await oauthLogin();
-  const res = await app.inject({ method: "POST", url: "/auth/otp/resend", cookies: { sid } });
-  assert.equal(res.statusCode, 429);
-  assert.equal(res.json().error, "OTP_COOLDOWN");
-});
-
 test("logout ends the session", { skip }, async () => {
-  const { sid, code } = await oauthLogin();
-  const fullSid = cookie(await verify(sid, code), "sid")!;
-  assert.equal((await app.inject({ method: "POST", url: "/auth/logout", cookies: { sid: fullSid } })).statusCode, 204);
-  assert.deepEqual((await me(fullSid)).json(), { error: "UNAUTHENTICATED" });
+  const sid = await loggedIn();
+  assert.equal((await app.inject({ method: "POST", url: "/auth/logout", cookies: { sid } })).statusCode, 204);
+  assert.deepEqual((await me(sid)).json(), { error: "UNAUTHENTICATED" });
 });
 
 test("providers without credentials are disabled", { skip }, async () => {
@@ -161,4 +149,33 @@ test("providers without credentials are disabled", { skip }, async () => {
   assert.deepEqual((await bare.inject({ url: "/auth/providers" })).json(), { providers: [] });
   assert.equal((await bare.inject({ url: "/auth/google/login" })).statusCode, 404);
   assert.equal((await bare.inject({ url: "/auth/twitter/login" })).statusCode, 400);
+});
+
+test("the email one-time-code endpoints are gone", { skip }, async () => {
+  const sid = await loggedIn();
+  for (const url of ["/auth/otp/verify", "/auth/otp/resend"]) {
+    assert.equal((await app.inject({ method: "POST", url, cookies: { sid }, payload: { code: "123456" } })).statusCode, 404, url);
+  }
+});
+
+test("profile: incomplete until PUT /me/profile; handle validated and unique; /me reflects it", { skip }, async () => {
+  const sid = await loggedIn();
+  const before = (await me(sid)).json();
+  assert.deepEqual([before.handle, before.profileComplete], [null, false]);
+
+  assert.equal((await putProfile(undefined, { displayName: "Jo", handle: "jo_123" })).statusCode, 401);
+  for (const bad of [{ displayName: "Jo", handle: "JO" }, { displayName: "Jo", handle: "a!" }, { displayName: "", handle: "okay_1" }, { displayName: "Jo" }]) {
+    assert.equal((await putProfile(sid, bad)).statusCode, 400, JSON.stringify(bad));
+  }
+
+  const handle = `t_${randomUUID().slice(0, 8)}`;
+  const ok = await putProfile(sid, { displayName: "  Trader Jo ", handle });
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual([ok.json().displayName, ok.json().handle, ok.json().profileComplete], ["Trader Jo", handle, true]);
+  const after = (await me(sid)).json(); // the cached profile was refreshed
+  assert.deepEqual([after.displayName, after.handle, after.profileComplete], ["Trader Jo", handle, true]);
+  assert.equal((await putProfile(sid, { displayName: "Trader Jo", handle })).statusCode, 200, "saving your own handle again is fine");
+
+  const other = await loggedIn();
+  assert.deepEqual([(await putProfile(other, { displayName: "Copy", handle })).statusCode, (await putProfile(other, { displayName: "Copy", handle })).json()], [409, { error: "HANDLE_TAKEN" }]);
 });

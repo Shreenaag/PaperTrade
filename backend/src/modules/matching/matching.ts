@@ -12,7 +12,9 @@ import { Book, stableUuid, type BookEvent } from "./book.js";
 //   traded price  -> market.prices.v1 + Redis market:prices
 //   day's OHLC    -> daily_bars
 // No offsets are committed. On start it reads the topic from the beginning and skips everything before
-// today's PRE_OPEN, rebuilding today's books exactly (books never outlive a 10-minute day).
+// today's PRE_OPEN, rebuilding today's books exactly. Orders carried over from earlier days are not in that part
+// of the log, so they are expired on start (expireStaleOrders) and their reservations released.
+// shortcut: carry-over only lasts while the worker runs; rebuilding carried orders from the DB races with unsettled fills.
 // Re-sent events carry the same ids, so settlement ignores them.
 // shortcut: reads the whole retained topic (1h) on start; fine at this volume, seek by timestamp if it grows.
 
@@ -80,16 +82,9 @@ export async function startMatching(kafka: Kafka, producer: Producer, db: Db, re
   // Phase changes enter the log as CLOCK commands (one per symbol). Duplicates are harmless: a book ignores
   // a phase it has already reached.
   let lastClock = "";
-  let lastDay = today;
   const tick = async () => {
     const { tradingDay, phase } = sessionAt();
     if (`${tradingDay}:${phase}` === lastClock) return;
-    if (tradingDay !== lastDay) {
-      // Orders the book never saw (Kafka log wiped mid-day) would otherwise stay open forever. Two days back,
-      // so a late fill from yesterday's close always reaches settlement before its order's END.
-      await expireStaleOrders(db, producer, tradingDay - 1);
-      lastDay = tradingDay;
-    }
     await producer.send({
       topic: Topics.orderCommands.name,
       messages: [...books.keys()].map((symbol) => ({
@@ -119,7 +114,7 @@ export async function untilSent(send: () => Promise<void>, waitMs = 1000): Promi
   }
 }
 
-// Orders from before `beforeDay` still open in the DB (the worker was down at day end, or Kafka was reset):
+// Orders from before `beforeDay` still open in the DB (carried over before a restart, or Kafka was reset):
 // expire them so their reservations come back. Same END id as the book would use, so never applied twice.
 export async function expireStaleOrders(db: Db, producer: Producer, beforeDay: number) {
   const stale = await db.order.findMany({

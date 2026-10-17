@@ -37,10 +37,14 @@ export interface PlaceOrderInput {
 
 const OPEN_STATUSES = ["OPEN", "PARTIALLY_FILLED"] as const;
 
-export async function placeOrder(db: Db, redis: Redis, trader: Trader, input: PlaceOrderInput, now = new Date()): Promise<Order> {
+// `replaces` (modify): the new order holds its own cash/shares; the old one's hold is released when the engine ends it.
+// shortcut: needs free funds for both until then (the DB forbids holding more than you have), so an all-in order
+// can't be modified, only cancelled and placed again. Upgrade: let settlement move the hold on the swap.
+export async function placeOrder(db: Db, redis: Redis, trader: Trader, input: PlaceOrderInput, now = new Date(), replaces?: Order): Promise<Order> {
   const { userId } = trader;
   const { symbol, side, type, quantity, clientOrderId } = input;
-  const { tradingDay } = sessionAt(now);
+  const { tradingDay, phase } = sessionAt(now);
+  if (phase === "CLOSED") throw new OrderError("MARKET_CLOSED", 409); // the pause between days
 
   if (clientOrderId) {
     const existing = await db.order.findUnique({ where: { userId_clientOrderId: { userId, clientOrderId } } });
@@ -74,7 +78,7 @@ export async function placeOrder(db: Db, redis: Redis, trader: Trader, input: Pl
   // BUY holds the most it can cost; FILL releases a share of it (settlement).
   const reserve = side === "BUY" ? worstPrice.mul(quantity).mul(new Decimal(1).add(FEE_RATE)).toDecimalPlaces(4, Decimal.ROUND_UP) : new Decimal(0);
 
-  if (!trader.isBot) await checkTraderLimits(db, redis, userId, tradingDay);
+  if (!trader.isBot) await checkTraderLimits(db, redis, userId, tradingDay, !replaces);
 
   try {
     return await db.$transaction(async (tx) => {
@@ -100,6 +104,7 @@ export async function placeOrder(db: Db, redis: Redis, trader: Trader, input: Pl
         limitPrice: limitPrice?.toFixed(4) ?? null,
         protectionPrice: protectionPrice?.toFixed(4) ?? null,
         tradingDay,
+        ...(replaces && { replaces: { orderId: replaces.id, remaining: replaces.quantity - replaces.filledQuantity } }),
       });
       return order;
     });
@@ -118,6 +123,17 @@ export async function cancelOrder(db: Db, userId: string, orderId: string): Prom
   if (!order) throw new OrderError("ORDER_NOT_FOUND", 404);
   if (!(OPEN_STATUSES as readonly string[]).includes(order.status)) throw new OrderError("ORDER_CLOSED", 409);
   await enqueueCommand(db, order.symbol, { kind: "CANCEL", orderId, userId, symbol: order.symbol });
+}
+
+// Modify a resting LIMIT order's price and open quantity: a new order replaces it (and joins the back of the queue).
+// The engine decides, like a cancel: if the old order fills first, the new one is rejected with ORDER_CHANGED.
+export async function modifyOrder(db: Db, redis: Redis, userId: string, orderId: string, change: { quantity: number; limitPrice: string; clientOrderId?: string }): Promise<Order> {
+  const order = await db.order.findFirst({ where: { id: orderId, userId } });
+  if (!order) throw new OrderError("ORDER_NOT_FOUND", 404);
+  if (!(OPEN_STATUSES as readonly string[]).includes(order.status)) throw new OrderError("ORDER_CLOSED", 409);
+  if (order.type !== "LIMIT") throw new OrderError("NOT_MODIFIABLE", 409);
+  const { symbol, side } = order;
+  return placeOrder(db, redis, { userId, isBot: false }, { symbol, side, type: "LIMIT", ...change }, new Date(), order);
 }
 
 export interface Page {
@@ -187,13 +203,14 @@ async function referencePrices(db: Db, redis: Redis, symbol: string, tradingDay:
   return { prevClose, last };
 }
 
-async function checkTraderLimits(db: Db, redis: Redis, userId: string, tradingDay: number) {
+async function checkTraderLimits(db: Db, redis: Redis, userId: string, tradingDay: number, countOpen: boolean) {
   if ((await countHit(redis, RedisKeys.rateLimit("orders-1s", userId), 1)) > OrderLimits.perSecond) {
     throw new OrderError("RATE_LIMITED", 429);
   }
   if ((await countHit(redis, RedisKeys.rateLimit(`orders-day${tradingDay}`, userId), DAY_SECONDS)) > OrderLimits.perDay) {
     throw new OrderError("DAILY_ORDER_LIMIT", 429);
   }
+  if (!countOpen) return; // a modify swaps one open order for another
   const open = await db.order.count({ where: { userId, status: { in: [...OPEN_STATUSES] } } });
   if (open >= OrderLimits.open) throw new OrderError("TOO_MANY_OPEN_ORDERS", 429);
 }
