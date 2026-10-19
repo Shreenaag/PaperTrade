@@ -70,7 +70,7 @@ services:
 
   # Containerised backend: docker compose --profile app up -d --build
   backend:
-    build: ./backend
+    build: { context: ., dockerfile: backend/Dockerfile }
     profiles: [app]
     env_file: .env
     environment:

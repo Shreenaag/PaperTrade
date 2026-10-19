@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+backend/src/generated
+**/*.log
+.env
+.git
+docs
+.superpowers
+.playwright-mcp
